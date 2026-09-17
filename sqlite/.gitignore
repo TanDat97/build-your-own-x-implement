@@ -1,0 +1,32 @@
+# Build output
+main
+tests/test_db
+
+# Object files / libraries
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.exe
+
+# Debug info
+*.dSYM/
+*.su
+*.idb
+*.pdb
+core
+vgcore.*
+
+# Database files produced by running the REPL or the tests
+*.db
+
+# Editor / OS noise
+*.swp
+*~
+.DS_Store
+
+# VS Code: launch.json and tasks.json are kept, everything else is local
+.vscode/*
+!.vscode/launch.json
+!.vscode/tasks.json
