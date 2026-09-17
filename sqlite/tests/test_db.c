@@ -1,6 +1,9 @@
 // Black-box tests for the db REPL.
 // Each test spawns ./main as a child process, writes commands to its stdin,
 // then compares the lines it printed on stdout against expected output.
+//
+// The REPL is file-backed, so every test starts by deleting DB_FILENAME. Without
+// that, rows written by one test would still be there for the next one.
 
 #include <errno.h>
 #include <fcntl.h>
@@ -12,6 +15,7 @@
 #include <sys/wait.h>
 
 #define MAX_LINES 4096
+#define DB_FILENAME "test.db"
 
 typedef struct
 {
@@ -25,6 +29,18 @@ static int tests_failed = 0;
 
 // Split on '\n', dropping a trailing empty field (same as Ruby's split("\n")),
 // so an output ending in "db > " keeps that last prompt as a line.
+// Port of the RSpec suite's `before { `rm -rf test.db` }`: start each test from an
+// empty database. Called per test rather than per run_script(), so a test can restart
+// the REPL against the same file to check that data persists.
+static void delete_db(void)
+{
+  if (unlink(DB_FILENAME) != 0 && errno != ENOENT)
+  {
+    perror("unlink " DB_FILENAME);
+    exit(EXIT_FAILURE);
+  }
+}
+
 static void split_lines(Output *output)
 {
   char *cursor = output->raw;
@@ -70,7 +86,7 @@ static Output run_script(const char *commands[], int num_commands)
     close(to_child[1]);
     close(from_child[0]);
     close(from_child[1]);
-    execl("./main", "./main", (char *)NULL);
+    execl("./main", "./main", DB_FILENAME, (char *)NULL);
     perror("execl ./main");
     _exit(EXIT_FAILURE);
   }
@@ -249,6 +265,8 @@ static char *repeat_char(char c, int n)
 
 static void test_inserts_and_retrieves_a_row(void)
 {
+  delete_db();
+
   const char *commands[] = {
       "insert 1 user1 person1@example.com",
       "select",
@@ -266,8 +284,46 @@ static void test_inserts_and_retrieves_a_row(void)
   free_output(&result);
 }
 
+static void test_keeps_data_after_closing_connection(void)
+{
+  delete_db();
+
+  const char *insert_commands[] = {
+      "insert 1 user1 person1@example.com",
+      ".exit",
+  };
+  const char *insert_expected[] = {
+      "db > Executed.",
+      "db > ",
+  };
+
+  Output result1 = run_script(insert_commands, 2);
+  expect_output("keeps data after closing connection (insert)", result1,
+                insert_expected, 2);
+  free_output(&result1);
+
+  // Second run: a fresh REPL against the same file, so the row can only come
+  // from what db_close() flushed to disk.
+  const char *select_commands[] = {
+      "select",
+      ".exit",
+  };
+  const char *select_expected[] = {
+      "db > (1, user1, person1@example.com)",
+      "Executed.",
+      "db > ",
+  };
+
+  Output result2 = run_script(select_commands, 2);
+  expect_output("keeps data after closing connection (select)", result2,
+                select_expected, 3);
+  free_output(&result2);
+}
+
 static void test_prints_error_message_when_table_is_full(void)
 {
+  delete_db();
+
   const int num_inserts = 1401;
   const char **commands = malloc(((size_t)num_inserts + 1) * sizeof(char *));
 
@@ -295,6 +351,8 @@ static void test_prints_error_message_when_table_is_full(void)
 
 static void test_allows_inserting_strings_that_are_the_maximum_length(void)
 {
+  delete_db();
+
   char *long_username = repeat_char('a', 32);
   char *long_email = repeat_char('a', 255);
 
@@ -322,6 +380,8 @@ static void test_allows_inserting_strings_that_are_the_maximum_length(void)
 
 static void test_prints_error_message_if_strings_are_too_long(void)
 {
+  delete_db();
+
   char *long_username = repeat_char('a', 33);
   char *long_email = repeat_char('a', 256);
 
@@ -346,6 +406,8 @@ static void test_prints_error_message_if_strings_are_too_long(void)
 
 static void test_prints_an_error_message_if_id_is_negative(void)
 {
+  delete_db();
+
   const char *commands[] = {
       "insert -1 cstack foo@bar.com",
       "select",
@@ -368,6 +430,7 @@ int main(void)
   printf("database\n");
 
   test_inserts_and_retrieves_a_row();
+  test_keeps_data_after_closing_connection();
   test_prints_error_message_when_table_is_full();
   test_allows_inserting_strings_that_are_the_maximum_length();
   test_prints_error_message_if_strings_are_too_long();

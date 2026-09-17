@@ -25,12 +25,19 @@ All commands run from `sqlite/`:
 ```bash
 make            # build the REPL -> ./main
 make test       # build ./main and ./tests/test_db, then run the suite
-make clean
+make clean      # also removes test.db
 ./main mydb.db  # run the REPL directly
 ```
 
+`main` requires a database filename; with no argument it prints
+`"Must supply a database filename."` and exits.
+
 `make test` must be run from `sqlite/` — `tests/test_db` execs `"./main"` by
-relative path, so the binary has to sit in the working directory.
+relative path, so the binary has to sit in the working directory. The tests use
+`test.db` in that same directory.
+
+Note that compiling straight to `./main` by hand gives the binary a newer mtime
+than `main.c`, so a following `make main` is a no-op. `rm -f main` first.
 
 There is no per-test filter. To run a single case, comment out the other
 `test_*()` calls in `main()` of `tests/test_db.c` and rebuild, or add a
@@ -49,11 +56,21 @@ temporary `argv` check.
 4. **Storage** — `Table` holds a row count and a `Pager`. `row_slot()` maps a row
    number to a byte offset: `page_num = row_num / ROWS_PER_PAGE`, then
    `row_offset * ROW_SIZE` within the page. `serialize_row` / `deserialize_row`
-   memcpy the `Row` struct into a compact on-page layout via the `*_OFFSET`
+   move the `Row` struct to and from a compact on-page layout via the `*_OFFSET`
    constants, so page bytes are the on-disk format, not the C struct.
+   `serialize_row` uses `strncpy` (not `memcpy`) for the two string columns so the
+   bytes after each terminator are zero-filled rather than leftover stack garbage —
+   that keeps written pages deterministic instead of leaking uninitialised memory
+   into the file. `id` still goes through `memcpy`; it is not a string.
 5. **Pager** — `pager_open()` / `get_page()` own the file descriptor and a
    `TABLE_MAX_PAGES` array of lazily-allocated 4K page caches; a page is read
    from disk only on first touch (cache miss).
+6. **Persistence** — `db_open()` builds the pager and derives `num_rows` from the
+   file length. `.exit` routes through `do_meta_command(input_buffer, table)` to
+   `db_close()`, which flushes each cached page with `pager_flush()`, closes the
+   fd and frees everything. `pager_flush` takes a byte count rather than always
+   writing `PAGE_SIZE`, because rows are packed tightly and the last page is
+   usually partial. There is no `free_table()` any more — `db_close()` replaced it.
 
 Every layer returns a result enum (`MetaCommandResult`, `PrepareResult`,
 `ExecuteResult`) rather than printing or exiting; the `switch` statements in
@@ -80,12 +97,20 @@ sends ~59K). Preserve that when touching the harness.
 `expect_line()` accepts negative indices (counting from the end), matching the
 tutorial's `result[-2]`.
 
+Because the REPL is file-backed, each `test_*()` starts with `delete_db()` (the
+port of the RSpec suite's `before` hook running `rm -rf test.db`) and `run_script()` execs
+`./main test.db`. `delete_db()` is deliberately called per test rather than inside
+`run_script()`, so a test can run the REPL twice against the same file — which is
+exactly what `test_keeps_data_after_closing_connection()` does to prove rows
+survive a restart. A single RSpec example that calls `run_script` twice becomes two
+`expect_output()` assertions here, so that one test reports as two.
+
 ### Current state
 
-`main.c` has an in-progress, non-compiling refactor that adds file-backed
-persistence (`Pager`, `pager_open`, `db_open`). Leftovers from the pre-pager
-version still reference the removed `table->pages`: `row_slot()` declares `page`
-twice, `free_table()` iterates `table->pages`, and `main()` calls the deleted
-`new_table()` instead of `db_open(argv[1])`. There is no `db_close()` flushing
-pages back to disk yet. Finish this before adding new features; the test suite
-cannot run until it builds.
+File-backed persistence is finished and the suite is green: 7 tests, 0 failures
+(`make test`). Every function in `main.c` carries a comment describing what it
+does; keep that up when adding new ones.
+
+The next step in the tutorial is replacing the append-only row array with a
+B-tree, which is what the "should not be needed after we switch to a B-tree"
+comment in `db_close()` refers to.

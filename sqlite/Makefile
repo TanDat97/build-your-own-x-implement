@@ -13,4 +13,4 @@ test: main tests/test_db
 	./tests/test_db
 
 clean:
-	rm -f main tests/test_db
+	rm -f main tests/test_db test.db
