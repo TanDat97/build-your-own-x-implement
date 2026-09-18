@@ -84,6 +84,13 @@ typedef struct
   Pager *pager;
 } Table;
 
+typedef struct
+{
+  Table *table;
+  uint32_t row_num;
+  bool end_of_table; // Indicates a position one past the last element
+} Cursor;
+
 // Print one row to stdout in the tutorial's (id, username, email) format.
 void print_row(Row *row)
 {
@@ -150,15 +157,55 @@ void *get_page(Pager *pager, uint32_t page_num)
   return pager->pages[page_num];
 }
 
-// Map a row number to the byte address where that row lives:
-// page_num = row_num / ROWS_PER_PAGE, then row_offset * ROW_SIZE inside the page.
-void *row_slot(Table *table, uint32_t row_num)
+// Make a cursor pointing at row 0, for a scan from the beginning. The table being
+// empty is what end_of_table records here, so a caller can loop on it straight away.
+// The cursor is malloc'd; the caller frees it.
+Cursor *table_start(Table *table)
 {
+  Cursor *cursor = malloc(sizeof(Cursor));
+  cursor->table = table;
+  cursor->row_num = 0;
+  cursor->end_of_table = (table->num_rows == 0);
+
+  return cursor;
+}
+
+// Make a cursor pointing one past the last row, which is where a new row gets
+// written. Always end_of_table: there is nothing to read at this position.
+// The cursor is malloc'd; the caller frees it.
+Cursor *table_end(Table *table)
+{
+  Cursor *cursor = malloc(sizeof(Cursor));
+  cursor->table = table;
+  cursor->row_num = table->num_rows;
+  cursor->end_of_table = true;
+
+  return cursor;
+}
+
+// Map the cursor's row number to the byte address where that row lives:
+// page_num = row_num / ROWS_PER_PAGE, then row_offset * ROW_SIZE inside the page.
+// This is the one place a row position becomes a pointer, so the B-tree rewrite
+// lands here rather than in the VM.
+void *cursor_value(Cursor *cursor)
+{
+  uint32_t row_num = cursor->row_num;
   uint32_t page_num = row_num / ROWS_PER_PAGE;
-  void *page = get_page(table->pager, page_num);
+  void *page = get_page(cursor->table->pager, page_num);
   uint32_t row_offset = row_num % ROWS_PER_PAGE;
   uint32_t byte_offset = row_offset * ROW_SIZE;
   return page + byte_offset;
+}
+
+// Step the cursor to the next row, setting end_of_table once it has moved past the
+// last one.
+void cursor_advance(Cursor *cursor)
+{
+  cursor->row_num += 1;
+  if (cursor->row_num >= cursor->table->num_rows)
+  {
+    cursor->end_of_table = true;
+  }
 }
 
 // Open (or create) the database file and build a Pager around it: records the file
@@ -405,9 +452,12 @@ ExecuteResult execute_insert(Statement *statement, Table *table)
   }
 
   Row *row_to_insert = &(statement->row_to_insert);
+  Cursor *cursor = table_end(table);
 
-  serialize_row(row_to_insert, row_slot(table, table->num_rows));
+  serialize_row(row_to_insert, cursor_value(cursor));
   table->num_rows += 1;
+
+  free(cursor);
 
   return EXECUTE_SUCCESS;
 }
@@ -415,12 +465,18 @@ ExecuteResult execute_insert(Statement *statement, Table *table)
 // Scan every row in the table and print it.
 ExecuteResult execute_select(Table *table)
 {
+  Cursor *cursor = table_start(table);
+
   Row row;
-  for (uint32_t i = 0; i < table->num_rows; i++)
+  while (!(cursor->end_of_table))
   {
-    deserialize_row(row_slot(table, i), &row);
+    deserialize_row(cursor_value(cursor), &row);
     print_row(&row);
+    cursor_advance(cursor);
   }
+
+  free(cursor);
+
   return EXECUTE_SUCCESS;
 }
 

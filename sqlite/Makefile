@@ -1,5 +1,5 @@
 CC     = gcc
-CFLAGS = -Wall -Wextra -g
+CFLAGS = -Wall -Wextra -g -Werror=implicit-function-declaration -Werror=int-conversion
 
 main: main.c
 	$(CC) $(CFLAGS) -o main main.c

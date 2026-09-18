@@ -1,0 +1,17 @@
+{
+  // Always squiggle, even if some include fails to resolve.
+  "C_Cpp.errorSquiggles": "enabled",
+
+  // clang-tidy (bundled with the C/C++ extension) is what turns a call to a
+  // missing function into a red *error*; plain gcc only warns about it.
+  "C_Cpp.codeAnalysis.clangTidy.enabled": true,
+  "C_Cpp.codeAnalysis.runAutomatically": true,
+  "C_Cpp.codeAnalysis.clangTidy.checks.enabled": [
+    "clang-diagnostic-*",
+    "bugprone-*"
+  ],
+  "C_Cpp.codeAnalysis.clangTidy.checks.disabled": [
+    "bugprone-implicit-widening-of-multiplication-result",
+    "bugprone-unchecked-string-to-number-conversion"
+  ]
+}

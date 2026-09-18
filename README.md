@@ -44,16 +44,27 @@ Executed.
 db > .exit
 ```
 
-The layers it is built from — input buffer, statement parser, virtual machine, and
-a pager over a fixed-size page cache — mirror the structure of real SQLite, at a
-much smaller scale. Rows live in 4KB pages that are read from the file on first
-touch and flushed back when the database is closed.
+The layers it is built from — input buffer, statement parser, virtual machine,
+cursor, and a pager over a fixed-size page cache — mirror the structure of real
+SQLite, at a much smaller scale. Rows live in 4KB pages that are read from the file
+on first touch and flushed back when the database is closed, and every read or
+write reaches them through a cursor rather than a raw row index, which is the seam
+a B-tree will slot into next.
 
 Tests live in `sqlite/tests/test_db.c` and drive the compiled REPL as a black box:
 they pipe a script into its stdin and compare stdout line by line. It is a C port
 of the tutorial's RSpec suite, with no test framework — `make test` runs all 7.
 
+Progress so far: the REPL and statement parser, rows packed into pages, the table's
+fixed size limits, file-backed persistence, and the cursor abstraction. A B-tree
+replacing the append-only row array is next.
+
 ## Requirements
 
 A C compiler (`gcc`) and `make`. Tools added later may bring their own toolchains;
 each folder documents what it needs.
+
+Build output and database files are ignored by git: the root `.gitignore` covers
+what every project shares (object files, debug and crash dumps, editor and OS
+noise), and each tool folder adds its own targets — for `sqlite/` that is `main`,
+`tests/test_db` and `*.db`.

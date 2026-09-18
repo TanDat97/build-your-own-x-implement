@@ -1,0 +1,38 @@
+# Repo-wide ignores. Each project directory may add its own .gitignore for
+# toolchain-specific artifacts (see sqlite/.gitignore).
+
+# Build output / object files
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.exe
+*.out
+
+# Debug info and crash dumps
+*.dSYM/
+*.su
+*.idb
+*.pdb
+core
+vgcore.*
+
+# Editor / OS noise
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+.idea/
+
+# VS Code: shared configs are kept, everything else is local
+.vscode/*
+!.vscode/launch.json
+!.vscode/tasks.json
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/c_cpp_properties.json
+
+# Local Claude Code settings
+.claude/settings.local.json
