@@ -174,13 +174,9 @@ static Output run_script(const char *commands[], int num_commands)
       {
         length += (size_t)n;
       }
-      else if (n == 0)
+      else if (n == 0 || (errno != EAGAIN && errno != EINTR))
       {
-        break; // EOF: child closed stdout
-      }
-      else if (errno != EAGAIN && errno != EINTR)
-      {
-        break;
+        break; // EOF (child closed stdout), or a read error worth giving up on
       }
     }
   }
