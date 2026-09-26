@@ -164,7 +164,7 @@ survive a restart. A single RSpec example that calls `run_script` twice becomes 
 ### Current state
 
 File-backed persistence and the cursor abstraction are both done, and the suite is
-green: 7 tests, 0 failures (`make test`). The cursor change is a pure refactor —
+green: 9 tests, 0 failures (`make test`). The cursor change is a pure refactor —
 it added no behaviour and no test, which is why the count did not move.
 
 Every function in `main.c` carries a comment describing what it does; keep that up

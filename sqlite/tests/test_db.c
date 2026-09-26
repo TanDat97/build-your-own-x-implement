@@ -421,6 +421,59 @@ static void test_prints_an_error_message_if_id_is_negative(void)
   free_output(&result);
 }
 
+static void test_prints_constants(void)
+{
+  delete_db();
+
+  const char *commands[] = {
+      ".constants",
+      ".exit",
+  };
+  const char *expected[] = {
+      "db > Constants:",
+      "ROW_SIZE: 293",
+      "COMMON_NODE_HEADER_SIZE: 6",
+      "LEAF_NODE_HEADER_SIZE: 10",
+      "LEAF_NODE_CELL_SIZE: 297",
+      "LEAF_NODE_SPACE_FOR_CELLS: 4086",
+      "LEAF_NODE_MAX_CELLS: 13",
+      "db > ",
+  };
+
+  Output result = run_script(commands, 2);
+  expect_output("prints constants", result, expected, 8);
+  free_output(&result);
+}
+
+static void test_allows_printing_out_the_structure_of_a_one_node_btree(void)
+{
+  delete_db();
+
+  const char *commands[] = {
+      "insert 3 user3 person3@example.com",
+      "insert 1 user1 person1@example.com",
+      "insert 2 user2 person2@example.com",
+      ".btree",
+      ".exit",
+  };
+  const char *expected[] = {
+      "db > Executed.",
+      "db > Executed.",
+      "db > Executed.",
+      "db > Tree:",
+      "leaf (size 3)",
+      "  - 0 : 3",
+      "  - 1 : 1",
+      "  - 2 : 2",
+      "db > ",
+  };
+
+  Output result = run_script(commands, 5);
+  expect_output("allows printing out the structure of a one-node btree", result,
+                expected, 9);
+  free_output(&result);
+}
+
 int main(void)
 {
   printf("database\n");
@@ -431,6 +484,8 @@ int main(void)
   test_allows_inserting_strings_that_are_the_maximum_length();
   test_prints_error_message_if_strings_are_too_long();
   test_prints_an_error_message_if_id_is_negative();
+  test_prints_constants();
+  test_allows_printing_out_the_structure_of_a_one_node_btree();
 
   printf("\n%d test%s, %d failure%s\n", tests_run, tests_run == 1 ? "" : "s",
          tests_failed, tests_failed == 1 ? "" : "s");
