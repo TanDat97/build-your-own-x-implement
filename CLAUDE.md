@@ -32,9 +32,41 @@ All commands run from `sqlite/`:
 ```bash
 make            # build the REPL -> ./main
 make test       # build ./main and ./tests/test_db, then run the suite
-make clean      # also removes test.db
+make clean      # also removes output/
 ./main mydb.db  # run the REPL directly
+make viz        # render output/trace.db to output/viz.html and open it
 ```
+
+Every generated file lives in `output/` (created on demand, git-ignored as a whole):
+`test.db` from the tests, and `trace.db`, `trace.html`, `viz.html` from the two HTML
+tools. `viz.html` and `trace.html` describe the same file, `output/trace.db`:
+`make trace` writes it and renders both pages, and `make viz` only re-renders
+`viz.html` from it (running the trace script first if `trace.db` is missing).
+
+`make viz` runs `tools/visualize.py`, which reads the layout sizes from
+`./main`'s `.constants` (run against a temp copy, so the db is not rewritten) and
+draws each page as a leaf node: byte-layout bar, cell table, colour-coded hex
+dump. The Row field widths are mirrored at the top of the script and checked
+against `ROW_SIZE`; update them there if `Row` changes.
+
+```bash
+make trace              # trace a default two-session run -> output/trace.html
+make trace IN=cmds.txt  # your own commands; a line of `---` restarts ./main
+```
+
+`make trace` runs `./main output/trace.db` under gdb (`tools/trace_gdb.py`), breaking on
+every function in `main.c` (found by regex, so new functions are picked up
+automatically). It records arguments, return values and argument state after the
+call, maps raw pointers to "page N + byte K", and snapshots the page cache and the
+file before each prompt, after each `pager_flush` and at exit. `tools/trace.py`
+renders that per command, plus a B-tree graph per step and a per-session
+filmstrip of the tree, with each function's description taken from the comment
+above it — another reason to keep those comments current. The layer grouping in
+`LAYERS` at the top of `trace.py` is manual; unlisted functions show as "Other".
+The tree walk starts at page 0 and already draws internal nodes: `trace_gdb.py`
+parses them as soon as `main.c` defines the tutorial's `INTERNAL_NODE_*` constants
+and sets the node-type byte, so node splitting needs no tracer changes unless those
+names differ.
 
 `main` requires a database filename; with no argument it prints
 `"Must supply a database filename."` and exits.
@@ -48,7 +80,8 @@ and then misbehaves at runtime.
 
 `make test` must be run from `sqlite/` — `tests/test_db` execs `"./main"` by
 relative path, so the binary has to sit in the working directory. The tests use
-`test.db` in that same directory.
+`output/test.db`; the `test` target creates `output/` first, since `main` opens
+the file with `O_CREAT` but cannot create the directory.
 
 Note that compiling straight to `./main` by hand gives the binary a newer mtime
 than `main.c`, so a following `make main` is a no-op. `rm -f main` first.
@@ -122,7 +155,7 @@ tutorial's `result[-2]`.
 
 Because the REPL is file-backed, each `test_*()` starts with `delete_db()` (the
 port of the RSpec suite's `before` hook running `rm -rf test.db`) and `run_script()` execs
-`./main test.db`. `delete_db()` is deliberately called per test rather than inside
+`./main output/test.db`. `delete_db()` is deliberately called per test rather than inside
 `run_script()`, so a test can run the REPL twice against the same file — which is
 exactly what `test_keeps_data_after_closing_connection()` does to prove rows
 survive a restart. A single RSpec example that calls `run_script` twice becomes two

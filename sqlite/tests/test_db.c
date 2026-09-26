@@ -15,7 +15,7 @@
 #include <sys/wait.h>
 
 #define MAX_LINES 4096
-#define DB_FILENAME "test.db"
+#define DB_FILENAME "output/test.db" // make test creates output/
 
 typedef struct
 {

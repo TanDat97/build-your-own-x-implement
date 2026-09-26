@@ -5,7 +5,10 @@
 main
 tests/test_db
 
-# Database files produced by running the REPL or the tests
+# Generated files: test.db, trace.db, trace.html and viz.html all go in output/
+output/
+
+# Database files from running the REPL by hand
 *.db
 
 # VS Code: shared configs are kept, everything else is local
