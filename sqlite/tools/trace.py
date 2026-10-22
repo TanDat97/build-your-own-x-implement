@@ -38,18 +38,28 @@ DEFAULT_SESSIONS = [
 LAYERS = [
     ("Input", ["new_input_buffer", "print_prompt", "read_input", "close_input_buffer"]),
     ("Front end", ["do_meta_command", "prepare_statement", "prepare_insert",
-                   "print_constants", "print_leaf_node"]),
+                   "print_constants", "print_tree", "indent"]),
     ("Virtual machine", ["execute_statement", "execute_insert", "execute_select", "print_row"]),
-    ("Cursor", ["table_start", "table_end", "cursor_value", "cursor_advance"]),
-    ("B-tree node / row", ["leaf_node_insert", "leaf_node_num_cells", "leaf_node_cell",
-                           "leaf_node_key", "leaf_node_value", "initialize_leaf_node",
+    ("Cursor", ["table_start", "table_find", "leaf_node_find", "cursor_value",
+                "cursor_advance"]),
+    ("B-tree node / row", ["leaf_node_insert", "leaf_node_split_and_insert", "create_new_root",
+                           "leaf_node_num_cells", "leaf_node_cell", "leaf_node_key",
+                           "leaf_node_value", "initialize_leaf_node",
+                           "internal_node_num_keys", "internal_node_right_child",
+                           "internal_node_cell", "internal_node_child", "internal_node_key",
+                           "initialize_internal_node", "get_node_type", "set_node_type",
+                           "is_node_root", "set_node_root", "get_node_max_key",
                            "serialize_row", "deserialize_row"]),
-    ("Pager", ["pager_open", "get_page", "pager_flush"]),
+    ("Pager", ["pager_open", "get_page", "get_unused_page_num", "pager_flush"]),
     ("Database", ["db_open", "db_close", "main"]),
 ]
 LAYER_OF = {fn: i for i, (_, fns) in enumerate(LAYERS) for fn in fns}
-# Pure pointer arithmetic, hidden by default to keep the call tree readable.
-HELPERS = {"leaf_node_num_cells", "leaf_node_cell", "leaf_node_key", "leaf_node_value"}
+# Pure pointer arithmetic and header-byte accessors, hidden by default to keep the
+# call tree readable.
+HELPERS = {"leaf_node_num_cells", "leaf_node_cell", "leaf_node_key", "leaf_node_value",
+           "internal_node_num_keys", "internal_node_right_child", "internal_node_cell",
+           "internal_node_child", "internal_node_key", "get_node_type", "set_node_type",
+           "is_node_root", "set_node_root"}
 
 FUNC_RE = re.compile(r"^([A-Za-z_][\w \t*]*?\b(\w+)\s*\([^;{)]*\))\s*\{", re.M)
 
@@ -91,9 +101,15 @@ def run_session(commands, tmp, n):
     out_json = os.path.join(tmp, f"trace{n}.json")
     env = dict(os.environ, TRACE_SRC="main.c", TRACE_DB=DB, TRACE_IN=inp,
                TRACE_STDOUT=os.path.join(tmp, f"stdout{n}.txt"), TRACE_OUT=out_json)
-    subprocess.run(["gdb", "-q", "-batch", "-nx", "-iex", "set debuginfod enabled off",
-                    "-x", os.path.join(HERE, "trace_gdb.py"), "./main"],
-                   env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    gdb = subprocess.run(["gdb", "-q", "-batch", "-nx", "-iex", "set debuginfod enabled off",
+                          "-x", os.path.join(HERE, "trace_gdb.py"), "./main"],
+                         env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    # gdb still exits 0 when trace_gdb.py raises, but the exception halts ./main
+    # mid-run, so the trace and trace.db would be silently cut short.
+    errors = [l for l in gdb.stderr.decode(errors="replace").splitlines()
+              if l.startswith("Python Exception")]
+    if errors:
+        sys.exit(f"trace_gdb.py failed in session {n}: " + "; ".join(errors))
     if not os.path.exists(out_json):
         sys.exit(f"gdb produced no trace for session {n}")
     return json.load(open(out_json))
@@ -232,7 +248,7 @@ def flow_boxes(step):
 
     exe = '<span class="muted">—</span>'
     for c in calls:
-        if c["fn"] in ("table_end", "table_start") and c.get("ret_data"):
+        if c["fn"] in ("table_find", "table_start") and c.get("ret_data"):
             cur = c["ret_data"]
             exe = (f"<code>{c['fn']}()</code> → cursor at page {cur['page_num']}, "
                    f"cell {cur['cell_num']}")
@@ -402,8 +418,8 @@ def draw_node(t, new_keys, cursor, mini, out):
 def step_cursor(step):
     """The cursor this step positioned: where an insert lands, or where a scan starts."""
     for c in step["calls"]:
-        if c["fn"] in ("table_end", "table_start") and c.get("ret_data"):
-            label = "insert here" if c["fn"] == "table_end" else "scan starts"
+        if c["fn"] in ("table_find", "table_start") and c.get("ret_data"):
+            label = "insert here" if c["fn"] == "table_find" else "scan starts"
             return dict(c["ret_data"], label=f"{c['fn']}(): {label}")
     return None
 
@@ -680,8 +696,8 @@ svg.bt {{ display: block; max-width: 100%; height: auto; overflow: visible; }}
     <h3>The path every command takes</h3>
     <div class="pipeline">
       <span class="L0">Input · read_input</span>→<span class="L1">Front end · prepare_statement</span>→
-      <span class="L2">VM · execute_*</span>→<span class="L3">Cursor · table_end / table_start</span>→
-      <span class="L4">Node · leaf_node_insert, serialize_row</span>→<span class="L5">Pager · get_page (memory)</span>→
+      <span class="L2">VM · execute_*</span>→<span class="L3">Cursor · table_find / table_start</span>→
+      <span class="L4">Node · leaf_node_insert (split when full), serialize_row</span>→<span class="L5">Pager · get_page (memory)</span>→
       <span class="L6">.exit · db_close → pager_flush (disk)</span>
     </div>
     <p class="muted small">Rows are written into a 4 KB page that lives in memory, in the pager's cache.
@@ -690,7 +706,7 @@ svg.bt {{ display: block; max-width: 100%; height: auto; overflow: visible; }}
   </section>
 
   <div class="toolbar">
-    <label><input type="checkbox" id="helpers"> show low-level helpers (leaf_node_cell, _key, _value, _num_cells)</label>
+    <label><input type="checkbox" id="helpers"> show low-level helpers (leaf_/internal_node_* accessors, node type and root flag)</label>
     <div class="legend">{legend}</div>
   </div>
 

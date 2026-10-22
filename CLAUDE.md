@@ -44,10 +44,13 @@ tools. `viz.html` and `trace.html` describe the same file, `output/trace.db`:
 `viz.html` from it (running the trace script first if `trace.db` is missing).
 
 `make viz` runs `tools/visualize.py`, which reads the layout sizes from
-`./main`'s `.constants` (run against a temp copy, so the db is not rewritten) and
-draws each page as a leaf node: byte-layout bar, cell table, colour-coded hex
-dump. The Row field widths are mirrored at the top of the script and checked
-against `ROW_SIZE`; update them there if `Row` changes.
+`./main`'s `.constants` (run against a temp copy, so the db is not rewritten),
+prints the tree from page 0 the way `.btree` does, and draws each page as a leaf
+or internal node (by its node-type byte): byte-layout bar, cell table,
+colour-coded hex dump. `.constants` only prints leaf sizes, so the Row field
+widths and the internal-node layout are mirrored at the top of the script; the Row
+widths are checked against `ROW_SIZE`. Update them there if `Row` or the internal
+node layout changes.
 
 ```bash
 make trace              # trace a default two-session run -> output/trace.html
@@ -63,10 +66,12 @@ renders that per command, plus a B-tree graph per step and a per-session
 filmstrip of the tree, with each function's description taken from the comment
 above it — another reason to keep those comments current. The layer grouping in
 `LAYERS` at the top of `trace.py` is manual; unlisted functions show as "Other".
-The tree walk starts at page 0 and already draws internal nodes: `trace_gdb.py`
-parses them as soon as `main.c` defines the tutorial's `INTERNAL_NODE_*` constants
-and sets the node-type byte, so node splitting needs no tracer changes unless those
-names differ.
+The tree walk starts at page 0 and draws internal nodes: `trace_gdb.py` parses
+them from the tutorial's `INTERNAL_NODE_*` constants and the node-type byte. The
+insert cursor is read from `table_find()`'s return value. gdb exits 0 even when
+`trace_gdb.py` raises (the exception just halts `./main` mid-run), so `trace.py`
+scans gdb's stderr for `Python Exception` and fails loudly instead of rendering a
+truncated trace.
 
 `main` requires a database filename; with no argument it prints
 `"Must supply a database filename."` and exits.

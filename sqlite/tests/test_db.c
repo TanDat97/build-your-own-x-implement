@@ -251,6 +251,19 @@ static void expect_line(const char *test_name, Output actual, int index,
   printf("    line %d got:      \"%s\"\n", index, got);
 }
 
+// Return a view of `output` without its first `n` lines, like Ruby's
+// result[n...result.length]. It shares the original's buffer, so free only the
+// original.
+static Output drop_lines(Output output, int n)
+{
+  Output tail = {.raw = output.raw, .count = 0};
+  for (int i = n; i < output.count; i++)
+  {
+    tail.lines[tail.count++] = output.lines[i];
+  }
+  return tail;
+}
+
 static char *repeat_char(char c, int n)
 {
   char *s = malloc((size_t)n + 1);
@@ -332,10 +345,13 @@ static void test_prints_error_message_when_table_is_full(void)
   commands[num_inserts] = ".exit";
 
   Output result = run_script(commands, num_inserts + 1);
-  // Ruby checks result[-2]: the response to the last insert, just before the
-  // bare prompt that .exit leaves behind.
-  expect_line("prints error message when table is full", result, -2,
-              "db > Error: Table full.");
+  // Ruby checks result.last(2). Once the root leaf has split, the next insert
+  // has to search an internal node, which is not implemented yet, so the REPL
+  // exits there instead of reaching a table-full error.
+  expect_line("prints error message when table is full (last insert)", result,
+              -2, "db > Executed.");
+  expect_line("prints error message when table is full (exit)", result, -1,
+              "db > Need to implement searching an internal node");
 
   free_output(&result);
   for (int i = 0; i < num_inserts; i++)
@@ -461,16 +477,64 @@ static void test_allows_printing_out_the_structure_of_a_one_node_btree(void)
       "db > Executed.",
       "db > Executed.",
       "db > Tree:",
-      "leaf (size 3)",
-      "  - 0 : 3",
-      "  - 1 : 1",
-      "  - 2 : 2",
+      "- leaf (size 3)",
+      "  - 1",
+      "  - 2",
+      "  - 3",
       "db > ",
   };
 
   Output result = run_script(commands, 5);
   expect_output("allows printing out the structure of a one-node btree", result,
                 expected, 9);
+  free_output(&result);
+}
+
+static void test_allows_printing_out_the_structure_of_a_3_leaf_node_btree(void)
+{
+  delete_db();
+
+  const int num_inserts = 14;
+  const char *commands[17];
+  char inserts[15][64];
+
+  for (int i = 1; i <= num_inserts; i++)
+  {
+    snprintf(inserts[i - 1], 64, "insert %d user%d person%d@example.com", i, i, i);
+    commands[i - 1] = inserts[i - 1];
+  }
+  commands[14] = ".btree";
+  snprintf(inserts[14], 64, "insert 15 user15 person15@example.com");
+  commands[15] = inserts[14];
+  commands[16] = ".exit";
+
+  const char *expected[] = {
+      "db > Tree:",
+      "- internal (size 1)",
+      "  - leaf (size 7)",
+      "    - 1",
+      "    - 2",
+      "    - 3",
+      "    - 4",
+      "    - 5",
+      "    - 6",
+      "    - 7",
+      "  - key 7",
+      "  - leaf (size 7)",
+      "    - 8",
+      "    - 9",
+      "    - 10",
+      "    - 11",
+      "    - 12",
+      "    - 13",
+      "    - 14",
+      "db > Need to implement searching an internal node",
+  };
+
+  Output result = run_script(commands, 17);
+  // Ruby checks result[14...result.length]: skip the 14 "Executed." lines.
+  expect_output("allows printing out the structure of a 3-leaf-node btree",
+                drop_lines(result, num_inserts), expected, 20);
   free_output(&result);
 }
 
@@ -486,6 +550,7 @@ int main(void)
   test_prints_an_error_message_if_id_is_negative();
   test_prints_constants();
   test_allows_printing_out_the_structure_of_a_one_node_btree();
+  test_allows_printing_out_the_structure_of_a_3_leaf_node_btree();
 
   printf("\n%d test%s, %d failure%s\n", tests_run, tests_run == 1 ? "" : "s",
          tests_failed, tests_failed == 1 ? "" : "s");

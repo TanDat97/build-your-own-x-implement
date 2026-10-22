@@ -14,6 +14,7 @@
     "bugprone-implicit-widening-of-multiplication-result",
     "bugprone-unchecked-string-to-number-conversion",
     "bugprone-suspicious-realloc-usage",
-    "bugprone-multi-level-implicit-pointer-conversion"
+    "bugprone-multi-level-implicit-pointer-conversion",
+    "bugprone-easily-swappable-parameters"
   ]
 }

@@ -3,12 +3,14 @@
 
 Usage: python3 tools/visualize.py <db file> <out.html>
 
-The page shows the REPL's layers, then every page of the file as a B-tree leaf
-node: a byte-layout bar, a table of its cells and a colour-coded hex dump.
+The page shows the REPL's layers and the B-tree as `.btree` prints it, then every
+page of the file as a leaf or internal node (decided by its node-type byte): a
+byte-layout bar, a table of its cells and a colour-coded hex dump.
 
-Node-layout sizes come from running `./main <db> .constants`, so they follow
-main.c. The Row's field widths are not printed by .constants and are mirrored
-below; they are checked against ROW_SIZE so a change to Row fails loudly here.
+Leaf-layout sizes come from running `./main <db> .constants`, so they follow
+main.c. The Row's field widths and the internal-node layout are not printed by
+.constants and are mirrored below; the Row widths are checked against ROW_SIZE so
+a change to Row fails loudly here.
 """
 
 import html
@@ -25,11 +27,21 @@ USERNAME_SIZE = 32 + 1
 EMAIL_SIZE = 255 + 1
 PAGE_SIZE = 4096
 
+# Internal-node layout and NodeType values, mirrored from main.c
+# (INTERNAL_NODE_*_SIZE and the NodeType enum).
+INTERNAL_NODE_NUM_KEYS_SIZE = 4
+INTERNAL_NODE_RIGHT_CHILD_SIZE = 4
+INTERNAL_NODE_CHILD_SIZE = 4
+INTERNAL_NODE_KEY_SIZE = 4
+INTERNAL_NODE_CELL_SIZE = INTERNAL_NODE_CHILD_SIZE + INTERNAL_NODE_KEY_SIZE
+NODE_INTERNAL, NODE_LEAF = 0, 1
+
 # Region -> (label, description). Order is the categorical slot order in the CSS.
 REGIONS = {
     "common": ("common header", "node type (1 B), is_root (1 B), parent pointer (4 B)"),
-    "ncells": ("num_cells", "how many cells this leaf holds (uint32)"),
-    "key": ("key", "cell key (uint32): the row id"),
+    "ncells": ("num_cells / num_keys", "how many cells a leaf holds, or keys an internal node holds (uint32)"),
+    "child": ("child page", "internal node: page number of a child (uint32); the right child sits in the header"),
+    "key": ("key", "cell key (uint32): the row id in a leaf, the left child's max key in an internal node"),
     "id": ("row.id", "serialized Row: id (uint32)"),
     "user": ("row.username", "serialized Row: username, 32 chars + NUL"),
     "email": ("row.email", "serialized Row: email, 255 chars + NUL"),
@@ -67,6 +79,47 @@ def cstr(raw):
 
 def parse_page(page, c):
     """Split one page into its header fields, cells and a byte -> region map."""
+    if page[0] == NODE_INTERNAL:
+        return parse_internal(page, c)
+    return parse_leaf(page, c)
+
+
+def internal_header_size(c):
+    return c["COMMON_NODE_HEADER_SIZE"] + INTERNAL_NODE_NUM_KEYS_SIZE + INTERNAL_NODE_RIGHT_CHILD_SIZE
+
+
+def internal_max_keys(c):
+    return (PAGE_SIZE - internal_header_size(c)) // INTERNAL_NODE_CELL_SIZE
+
+
+def parse_internal(page, c):
+    """An internal node: num_keys and right child in the header, then (child, key) cells."""
+    common = c["COMMON_NODE_HEADER_SIZE"]
+    nkeys_end = common + INTERNAL_NODE_NUM_KEYS_SIZE
+    hdr = internal_header_size(c)
+    node_type, is_root = page[0], page[1]
+    parent, num_keys, right = struct.unpack_from("<III", page, 2)
+    shown = min(num_keys, internal_max_keys(c))
+
+    regions = [("common", 0, common), ("ncells", common, nkeys_end), ("child", nkeys_end, hdr)]
+    cells = []
+    for i in range(shown):
+        start = hdr + i * INTERNAL_NODE_CELL_SIZE
+        child, key = struct.unpack_from("<II", page, start)
+        cells.append(dict(i=i, start=start, child=child, key=key))
+        regions += [
+            ("child", start, start + INTERNAL_NODE_CHILD_SIZE),
+            ("key", start + INTERNAL_NODE_CHILD_SIZE, start + INTERNAL_NODE_CELL_SIZE),
+        ]
+    end = hdr + shown * INTERNAL_NODE_CELL_SIZE
+    regions.append(("free", end, PAGE_SIZE))
+    return dict(kind="internal", node_type=node_type, is_root=is_root, parent=parent,
+                num_keys=num_keys, right=right, cells=cells, regions=regions,
+                header=hdr, used=end)
+
+
+def parse_leaf(page, c):
+    """A leaf node: num_cells in the header, then (key, row) cells."""
     hdr = c["LEAF_NODE_HEADER_SIZE"]
     common = c["COMMON_NODE_HEADER_SIZE"]
     cell_size = c["LEAF_NODE_CELL_SIZE"]
@@ -92,8 +145,8 @@ def parse_page(page, c):
         ]
     end = hdr + shown * cell_size
     regions.append(("free", end, PAGE_SIZE))
-    return dict(node_type=node_type, is_root=is_root, parent=parent,
-                num_cells=num_cells, cells=cells, regions=regions)
+    return dict(kind="leaf", node_type=node_type, is_root=is_root, parent=parent,
+                num_cells=num_cells, cells=cells, regions=regions, header=hdr, used=end)
 
 
 def region_tip(kind, a, b, cell=None):
@@ -105,10 +158,14 @@ def region_tip(kind, a, b, cell=None):
 def render_bar(p):
     out = []
     cell = -1
+    # The first region of each cell: a leaf cell starts with its key, an internal cell
+    # with its child pointer. The header's right-child pointer is not a cell.
+    first = "child" if p["kind"] == "internal" else "key"
     for kind, a, b in p["regions"]:
-        if kind == "key":
+        in_cell = a >= p["header"] and kind != "free"
+        if in_cell and kind == first:
             cell += 1
-        tip = region_tip(kind, a, b, cell if kind in ("key", "id", "user", "email") else None)
+        tip = region_tip(kind, a, b, cell if in_cell else None)
         # flex-grow by byte count, so the 2px gaps come out of the whole bar evenly
         out.append(f'<span class="seg r-{kind}" style="flex:{b - a} 1 0" '
                    f'data-tip="{html.escape(tip)}"></span>')
@@ -116,8 +173,12 @@ def render_bar(p):
 
 
 def render_hex(page, p, c):
-    """Hex dump of the header plus the first cell, each byte coloured by region."""
-    limit = c["LEAF_NODE_HEADER_SIZE"] + (c["LEAF_NODE_CELL_SIZE"] if p["cells"] else 16)
+    """Hex dump of the header plus the first cell (first few for an internal node),
+    each byte coloured by region."""
+    if p["kind"] == "internal":
+        limit = p["header"] + max(min(len(p["cells"]), 4) * INTERNAL_NODE_CELL_SIZE, 16)
+    else:
+        limit = p["header"] + (c["LEAF_NODE_CELL_SIZE"] if p["cells"] else 16)
     owner = ["free"] * PAGE_SIZE
     for kind, a, b in p["regions"]:
         for i in range(a, b):
@@ -151,15 +212,16 @@ def render_hex(page, p, c):
 
 def render_page(num, page, c):
     p = parse_page(page, c)
+    if p["kind"] == "internal":
+        return render_internal(num, page, p, c)
     keys = [cell["key"] for cell in p["cells"]]
     notes = []
     if keys != sorted(keys):
-        notes.append("Keys are in insertion order, not sorted: execute_insert always "
-                     "writes at table_end(). Sorted insert comes in the next tutorial part.")
-    if p["node_type"] == 0:
-        notes.append("Node type byte is 0 (NODE_INTERNAL) even though this is a leaf: "
-                     "initialize_leaf_node() only zeroes num_cells so far.")
-    used = c["LEAF_NODE_HEADER_SIZE"] + len(p["cells"]) * c["LEAF_NODE_CELL_SIZE"]
+        notes.append("Keys are not in sorted order: leaf_node_find() is meant to keep each "
+                     "leaf sorted by key.")
+    if any(x["id"] != x["key"] for x in p["cells"]):
+        notes.append("Some row.id values differ from their cell's key: the serialized row "
+                     "does not start at leaf_node_value(), so the row bytes are misplaced.")
 
     rows = "".join(
         f"<tr><td>{x['i']}</td><td>{x['start']}</td><td>{x['key']}</td><td>{x['id']}</td>"
@@ -169,11 +231,11 @@ def render_page(num, page, c):
 
     return f"""
 <section class="card">
-  <h2>Page {num} <span class="muted">· offset {num * PAGE_SIZE} in the file</span></h2>
+  <h2>Page {num} <span class="muted">· leaf{' · root' if p['is_root'] else ''} · offset {num * PAGE_SIZE} in the file</span></h2>
   <div class="stats">
     <div><p><b>{p['num_cells']}</b> / {c['LEAF_NODE_MAX_CELLS']}</p><span>cells</span></div>
-    <div><p><b>{used}</b> / {PAGE_SIZE}</p><span>bytes used</span></div>
-    <div><b>{p['node_type']}</b><span>node type</span></div>
+    <div><p><b>{p['used']}</b> / {PAGE_SIZE}</p><span>bytes used</span></div>
+    <div><b>{p['node_type']}</b><span>node type (leaf)</span></div>
     <div><b>{p['is_root']}</b><span>is_root</span></div>
     <div><b>{p['parent']}</b><span>parent</span></div>
   </div>
@@ -189,15 +251,76 @@ def render_page(num, page, c):
 </section>"""
 
 
+def render_internal(num, page, p, c):
+    rows = "".join(
+        f"<tr><td>{x['i']}</td><td>{x['start']}</td><td>page {x['child']}</td><td>{x['key']}</td>"
+        f"<td class='muted'>keys ≤ {x['key']}</td></tr>"
+        for x in p["cells"]
+    )
+    last = p["cells"][-1]["key"] if p["cells"] else None
+    rows += (f"<tr><td>right</td><td>{c['COMMON_NODE_HEADER_SIZE'] + INTERNAL_NODE_NUM_KEYS_SIZE}</td>"
+             f"<td>page {p['right']}</td><td class='muted'>—</td>"
+             f"<td class='muted'>{f'keys > {last}' if last is not None else 'every key'}</td></tr>")
+
+    return f"""
+<section class="card">
+  <h2>Page {num} <span class="muted">· internal{' · root' if p['is_root'] else ''} · offset {num * PAGE_SIZE} in the file</span></h2>
+  <div class="stats">
+    <div><p><b>{p['num_keys']}</b> / {internal_max_keys(c)}</p><span>keys</span></div>
+    <div><p><b>{p['used']}</b> / {PAGE_SIZE}</p><span>bytes used</span></div>
+    <div><b>{p['node_type']}</b><span>node type (internal)</span></div>
+    <div><b>{p['is_root']}</b><span>is_root</span></div>
+    <div><b>{p['parent']}</b><span>parent</span></div>
+    <div><b>{p['right']}</b><span>right child</span></div>
+  </div>
+  <h3>Byte layout (4096 B, hover a segment)</h3>
+  {render_bar(p)}
+  <div class="axis"><span>0</span><span>1024</span><span>2048</span><span>3072</span><span>4096</span></div>
+  <h3>Children: where a key search goes next</h3>
+  <table><thead><tr><th>cell</th><th>byte offset</th><th>child</th><th>key</th>
+  <th>holds</th></tr></thead><tbody>{rows}</tbody></table>
+  <h3>Raw bytes: header + first cells</h3>
+  <div class="hex">{render_hex(page, p, c)}</div>
+</section>"""
+
+
+def render_tree(pages, c):
+    """The tree from page 0 down, in the same shape `.btree` prints it."""
+    lines = []
+
+    def walk(num, level, seen):
+        pad = "  " * level
+        if num >= len(pages) or num in seen:
+            lines.append(f"{pad}- page {num}: {'loop' if num in seen else 'not in the file'}")
+            return
+        seen = seen | {num}
+        p = parse_page(pages[num], c)
+        if p["kind"] == "leaf":
+            keys = ", ".join(str(x["key"]) for x in p["cells"])
+            lines.append(f"{pad}- leaf (size {p['num_cells']}) · page {num}: {keys}")
+            return
+        lines.append(f"{pad}- internal (size {p['num_keys']}) · page {num}")
+        for x in p["cells"]:
+            walk(x["child"], level + 1, seen)
+            lines.append(f"{pad}  - key {x['key']}")
+        walk(p["right"], level + 1, seen)
+
+    if pages:
+        walk(0, 0, frozenset())
+    return html.escape("\n".join(lines)) or "The file has no pages yet."
+
+
 LAYERS = [
     ("Input", "read_input()", "one line from stdin"),
     ("Front end", "do_meta_command() · prepare_statement()", "text → Statement; no data touched"),
     ("Virtual machine", "execute_insert() · execute_select()", "talks only to a Cursor"),
-    ("Cursor", "table_start() · table_end() · cursor_advance() · cursor_value()",
+    ("Cursor", "table_start() · table_find() · leaf_node_find() · cursor_advance() · cursor_value()",
      "a finger on (page_num, cell_num)"),
-    ("B-tree node", "leaf_node_cell() · leaf_node_key() · leaf_node_value() · leaf_node_insert()",
-     "pointer arithmetic inside one page"),
-    ("Pager", "get_page() · pager_flush()", "cache of 4 KB pages, flushed on .exit"),
+    ("B-tree node", "leaf_node_insert() · leaf_node_split_and_insert() · create_new_root() · "
+     "leaf_node_*() · internal_node_*()",
+     "pointer arithmetic inside one page; a full leaf splits"),
+    ("Pager", "get_page() · get_unused_page_num() · pager_flush()",
+     "cache of 4 KB pages, flushed on .exit"),
     ("File", "db_open() · db_close()", "a whole number of 4096-byte pages"),
 ]
 
@@ -218,7 +341,7 @@ def render(db_path, data, c):
     return TEMPLATE.format(
         title=html.escape(os.path.basename(db_path)),
         size=len(data), npages=len(pages), layers=layers, legend=legend,
-        consts=consts, body=body,
+        consts=consts, tree=render_tree(pages, c), body=body,
     )
 
 
@@ -231,16 +354,16 @@ TEMPLATE = """<!doctype html>
   color-scheme: light;
   --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
   --grid: #e1e0d9; --ring: rgba(11,11,11,0.10);
-  --c-common: #2a78d6; --c-ncells: #eb6834; --c-key: #1baf7a; --c-id: #eda100;
-  --c-user: #e87ba4; --c-email: #008300; --c-free: #e1e0d9;
+  --c-common: #2a78d6; --c-ncells: #eb6834; --c-child: #7a5bd1; --c-key: #1baf7a;
+  --c-id: #eda100; --c-user: #e87ba4; --c-email: #008300; --c-free: #e1e0d9;
 }}
 @media (prefers-color-scheme: dark) {{
   :root:where(:not([data-theme="light"])) .viz-root {{
     color-scheme: dark;
     --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
     --grid: #2c2c2a; --ring: rgba(255,255,255,0.10);
-    --c-common: #3987e5; --c-ncells: #d95926; --c-key: #199e70; --c-id: #c98500;
-    --c-user: #d55181; --c-email: #008300; --c-free: #2c2c2a;
+    --c-common: #3987e5; --c-ncells: #d95926; --c-child: #8f73e0; --c-key: #199e70;
+    --c-id: #c98500; --c-user: #d55181; --c-email: #008300; --c-free: #2c2c2a;
   }}
 }}
 * {{ box-sizing: border-box; }}
@@ -278,11 +401,14 @@ th {{ color: var(--ink-2); font-weight: 600; font-size: 12px; }}
 .seg {{ min-width: 2px; border-radius: 4px; cursor: default; }}
 .seg:hover {{ outline: 2px solid var(--ink); outline-offset: 1px; }}
 .r-common {{ background: var(--c-common); }} .r-ncells {{ background: var(--c-ncells); }}
+.r-child {{ background: var(--c-child); }}
 .r-key {{ background: var(--c-key); }} .r-id {{ background: var(--c-id); }}
 .r-user {{ background: var(--c-user); }} .r-email {{ background: var(--c-email); }}
 .r-free {{ background: var(--c-free); }}
 .axis {{ display: flex; justify-content: space-between; color: var(--muted); font-size: 11px;
   margin-top: 4px; font-variant-numeric: tabular-nums; }}
+.tree {{ font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 0;
+  white-space: pre; overflow-x: auto; }}
 .note {{ border-left: 3px solid var(--muted); padding: 2px 10px; color: var(--ink-2); margin: 12px 0 0; }}
 .hex {{ font: 12px/1.7 ui-monospace, SFMono-Regular, Menlo, monospace; overflow-x: auto; }}
 .hexrow {{ display: flex; gap: 16px; white-space: pre; }}
@@ -291,11 +417,12 @@ th {{ color: var(--ink-2); font-weight: 600; font-size: 12px; }}
 .hexes {{ display: inline-grid; grid-template-columns: repeat(16, 2.4ch); }}
 .hx {{ cursor: default; }}
 .t-common {{ color: var(--c-common); }} .t-ncells {{ color: var(--c-ncells); }}
+.t-child {{ color: var(--c-child); }}
 .t-key {{ color: var(--c-key); }} .t-id {{ color: var(--c-id); }}
 .t-user {{ color: var(--c-user); }} .t-email {{ color: var(--c-email); }}
 .t-free {{ color: var(--muted); }}
 .zero {{ opacity: 0.35; }}
-.hx.t-common, .hx.t-ncells, .hx.t-key, .hx.t-id, .hx.t-user, .hx.t-email {{ font-weight: 700; }}
+.hx.t-common, .hx.t-ncells, .hx.t-child, .hx.t-key, .hx.t-id, .hx.t-user, .hx.t-email {{ font-weight: 700; }}
 #tip {{ position: fixed; pointer-events: none; background: var(--surface); color: var(--ink);
   border: 1px solid var(--ring); border-radius: 6px; padding: 6px 10px; font-size: 12px;
   box-shadow: 0 4px 16px rgba(0,0,0,0.15); max-width: 360px; display: none; z-index: 10; }}
@@ -316,6 +443,11 @@ th {{ color: var(--ink-2); font-weight: 600; font-size: 12px; }}
       <div class="legend">{legend}</div>
     </section>
   </div>
+
+  <section class="card">
+    <h2>B-tree <span class="muted">· walked from page 0, as <code>.btree</code> prints it</span></h2>
+    <pre class="tree">{tree}</pre>
+  </section>
 
   {body}
 </main><div id="tip" role="tooltip"></div></div>

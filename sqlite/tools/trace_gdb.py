@@ -302,7 +302,15 @@ def on_return(call, rv):
         if cur:
             base = page_ptrs()[cur["page_num"]]
             data = bytes(gdb.selected_inferior().read_memory(base, consts()["PAGE_SIZE"]))
-            call["notes"].append(f"page {cur['page_num']} now has {parse_node(data)['num_cells']} cell(s)")
+            node = parse_node(data)
+            # A full leaf splits, and if it was the root its page is rewritten as an
+            # internal node, which has keys rather than cells.
+            if node["kind"] == "internal":
+                call["notes"].append(f"page {cur['page_num']} split: now an internal node with "
+                                     f"{node['num_keys']} key(s), children on pages "
+                                     f"{', '.join(map(str, node['children']))}")
+            else:
+                call["notes"].append(f"page {cur['page_num']} now has {node['num_cells']} cell(s)")
     if fn == "pager_flush":
         snapshot("after pager_flush")
     if fn == "db_close":
