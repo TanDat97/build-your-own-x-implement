@@ -3,7 +3,7 @@
 
 # Build output (Makefile targets)
 main
-tests/test_db
+tests/test_db.db
 
 # Generated files: test.db, trace.db, trace.html and viz.html all go in output/
 output/

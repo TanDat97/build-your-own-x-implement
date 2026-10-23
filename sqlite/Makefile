@@ -7,14 +7,14 @@ OUT = output
 main: main.c
 	$(CC) $(CFLAGS) -o main main.c
 
-tests/test_db: tests/test_db.c
-	$(CC) $(CFLAGS) -o tests/test_db tests/test_db.c
+tests/test_db.db: tests/test_db.c
+	$(CC) $(CFLAGS) -o tests/test_db.db tests/test_db.c
 
 # ./main must sit in the working directory, since the tests exec "./main"
 .PHONY: test clean viz trace
-test: main tests/test_db
+test: main tests/test_db.db
 	@mkdir -p $(OUT)
-	./tests/test_db
+	./tests/test_db.db
 
 # Both HTML views read the same database, $(OUT)/trace.db, which `make trace` writes.
 # `make trace` runs the REPL under gdb, records every call into main.c, renders
@@ -33,5 +33,5 @@ viz: main
 	@xdg-open $(OUT)/viz.html > /dev/null 2>&1 || echo "open $(OUT)/viz.html in a browser"
 
 clean:
-	rm -f main tests/test_db
+	rm -f main tests/test_db.db
 	rm -rf $(OUT)

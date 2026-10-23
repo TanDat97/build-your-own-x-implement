@@ -128,7 +128,7 @@ const uint32_t LEAF_NODE_SPACE_FOR_CELLS = PAGE_SIZE - LEAF_NODE_HEADER_SIZE;   
 const uint32_t LEAF_NODE_MAX_CELLS = LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE; // Maximum number of cells in a leaf node (4086 / 297 = 13 cells)
 
 const uint32_t LEAF_NODE_RIGHT_SPLIT_COUNT = (LEAF_NODE_MAX_CELLS + 1) / 2;                          // When splitting a leaf node, the right node gets half of the cells (7 cells)
-const uint32_t LEAF_NODE_LEFT_SPLIT_COUNT = (LEAF_NODE_MAX_CELLS + 1) - LEAF_NODE_RIGHT_SPLIT_COUNT; // When splitting a leaf node, the left node gets the other half of the cells (6 cells)
+const uint32_t LEAF_NODE_LEFT_SPLIT_COUNT = (LEAF_NODE_MAX_CELLS + 1) - LEAF_NODE_RIGHT_SPLIT_COUNT; // When splitting a leaf node, the left node gets the other half of the cells (7 cells)
 
 /*
  * Internal Node Header Layout
@@ -255,7 +255,7 @@ uint32_t *internal_node_child(void *node, uint32_t child_num)
 // number.
 uint32_t *internal_node_key(void *node, uint32_t key_num)
 {
-  return internal_node_cell(node, key_num) + INTERNAL_NODE_CHILD_SIZE;
+  return (void *)internal_node_cell(node, key_num) + INTERNAL_NODE_CHILD_SIZE;
 }
 
 // Turn a page into an empty internal node: mark its type as NODE_INTERNAL, clear the
@@ -469,9 +469,40 @@ Cursor *leaf_node_find(Table *table, uint32_t page_num, uint32_t key)
   return cursor;
 }
 
+// Binary-search internal node `page_num` for the child whose range covers `key` (the
+// first child whose max key is >= key, else the right child), then recurse into it
+// until a leaf, returning leaf_node_find's cursor there. The cursor is malloc'd; the
+// caller frees it.
+Cursor* internal_node_find(Table* table, uint32_t page_num, uint32_t key) {
+  void* node = get_page(table->pager, page_num);
+  uint32_t num_keys = *internal_node_num_keys(node);
+
+  /* Binary search to find index of child to search */
+  uint32_t min_index = 0;
+  uint32_t max_index = num_keys; /* there is one more child than key */
+
+  while (min_index != max_index) {
+    uint32_t index = (min_index + max_index) / 2;
+    uint32_t key_to_right = *internal_node_key(node, index);
+    if (key_to_right >= key) {
+      max_index = index;
+    } else {
+      min_index = index + 1;
+    }
+  }
+  uint32_t child_num = *internal_node_child(node, min_index);
+  void* child = get_page(table->pager, child_num);
+  switch (get_node_type(child)) {
+    case NODE_LEAF:
+      return leaf_node_find(table, child_num, key);
+    case NODE_INTERNAL:
+      return internal_node_find(table, child_num, key);
+  }
+}
+
 // Return a cursor at the position of `key` in the table, or where it should be inserted
-// if it is not present. Only a leaf root is searched so far; an internal root exits,
-// since searching internal nodes is not implemented yet.
+// if it is not present: search the root directly if it is a leaf, otherwise descend
+// from it through internal_node_find to the leaf that should hold the key.
 Cursor *table_find(Table *table, uint32_t key)
 {
   uint32_t root_page_num = table->root_page_num;
@@ -483,8 +514,7 @@ Cursor *table_find(Table *table, uint32_t key)
   }
   else
   {
-    printf("Need to implement searching an internal node\n");
-    exit(EXIT_FAILURE);
+    return internal_node_find(table, root_page_num, key);
   }
 }
 
@@ -679,8 +709,8 @@ void db_close(Table *table)
 }
 
 // Handle a '.'-prefixed meta command: ".exit" cleans up and terminates, ".btree" prints
-// the root leaf node, ".constants" prints the layout sizes; anything else reports back
-// as unrecognized.
+// the whole tree from the root, ".constants" prints the layout sizes; anything else
+// reports back as unrecognized.
 MetaCommandResult do_meta_command(InputBuffer *input_buffer, Table *table)
 {
   if (strcmp(input_buffer->buffer, ".exit") == 0)
@@ -886,9 +916,10 @@ void leaf_node_insert(Cursor *cursor, uint32_t key, Row *value)
   serialize_row(value, leaf_node_value(node, cursor->cell_num));
 }
 
-// Insert the statement's row into the root leaf node, keyed by its id, at the sorted
-// position found by table_find. Fails with EXECUTE_TABLE_FULL if the node is full, or
-// EXECUTE_DUPLICATE_KEY if that id is already present.
+// Insert the statement's row keyed by its id, at the sorted position table_find returns;
+// leaf_node_insert splits the leaf if it is full. Fails with EXECUTE_DUPLICATE_KEY if
+// that id is already present. The duplicate check still reads the root page as a leaf,
+// so it only works while the root is a leaf.
 ExecuteResult execute_insert(Statement *statement, Table *table)
 {
   void *node = get_page(table->pager, table->root_page_num);

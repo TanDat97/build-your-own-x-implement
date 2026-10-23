@@ -345,13 +345,14 @@ static void test_prints_error_message_when_table_is_full(void)
   commands[num_inserts] = ".exit";
 
   Output result = run_script(commands, num_inserts + 1);
-  // Ruby checks result.last(2). Once the root leaf has split, the next insert
-  // has to search an internal node, which is not implemented yet, so the REPL
-  // exits there instead of reaching a table-full error.
+  // Ruby checks result.last(2). Inserts now find their leaf through the root, but
+  // once the right leaf fills up it has to split under an existing parent, which
+  // is not implemented yet, so the REPL exits there instead of reaching a
+  // table-full error.
   expect_line("prints error message when table is full (last insert)", result,
               -2, "db > Executed.");
   expect_line("prints error message when table is full (exit)", result, -1,
-              "db > Need to implement searching an internal node");
+              "db > Need to implement updating parent after split");
 
   free_output(&result);
   for (int i = 0; i < num_inserts; i++)
@@ -528,13 +529,14 @@ static void test_allows_printing_out_the_structure_of_a_3_leaf_node_btree(void)
       "    - 12",
       "    - 13",
       "    - 14",
-      "db > Need to implement searching an internal node",
+      "db > Executed.",
+      "db > ",
   };
 
   Output result = run_script(commands, 17);
   // Ruby checks result[14...result.length]: skip the 14 "Executed." lines.
   expect_output("allows printing out the structure of a 3-leaf-node btree",
-                drop_lines(result, num_inserts), expected, 20);
+                drop_lines(result, num_inserts), expected, 21);
   free_output(&result);
 }
 

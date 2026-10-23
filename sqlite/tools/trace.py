@@ -6,7 +6,8 @@ Usage: python3 tools/trace.py [commands.txt]
 commands.txt holds REPL input, one command per line. A line containing only
 `---` ends one session and starts another: ./main is restarted on the same
 output/trace.db, which shows the data coming back from the file. With no file, a
-default two-session script is used.
+default two-session script is used: it fills the root leaf, then splits it into
+an internal node over two leaves.
 
 For every command the page shows the data flowing Input -> Statement -> Cursor
 -> page cache (memory) -> trace.db (disk), and the full call tree with each
@@ -27,10 +28,21 @@ OUT_DIR = "output"
 DB = os.path.join(OUT_DIR, "trace.db")
 OUT = os.path.join(OUT_DIR, "trace.html")
 
+NAMES = ["alice", "bob", "carol", "dave", "eve", "frank", "grace", "heidi", "ivan",
+         "judy", "mallory", "niaj", "olivia", "peggy", "rupert"]
+
+
+def insert(i):
+    return f"insert {i} {NAMES[i - 1]} {NAMES[i - 1]}@example.com"
+
+
+# Session 1 fills the root leaf to LEAF_NODE_MAX_CELLS (13). Session 2 reloads it
+# from disk, and the 14th insert splits it: the root becomes an internal node over
+# two leaves. The 15th insert is then routed through that internal node. Session 2
+# has no `select`, since table_start() still reads the root as a leaf.
 DEFAULT_SESSIONS = [
-    ["insert 1 alice alice@example.com", "insert 2 bob bob@example.com", "select", ".exit"],
-    ["insert 3 carol carol@example.com", "insert 4 dave dave@example.com",
-     "insert 5 eve eve@example.com", "select", ".exit"],
+    [insert(i) for i in range(1, 14)] + ["select", ".btree", ".exit"],
+    [insert(14), ".btree", insert(15), ".btree", ".exit"],
 ]
 
 # Layer of each function, in the order data flows through them. Functions not

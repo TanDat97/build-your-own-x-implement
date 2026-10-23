@@ -31,7 +31,7 @@ All commands run from `sqlite/`:
 
 ```bash
 make            # build the REPL -> ./main
-make test       # build ./main and ./tests/test_db, then run the suite
+make test       # build ./main and ./tests/test_db.db, then run the suite
 make clean      # also removes output/
 ./main mydb.db  # run the REPL directly
 make viz        # render output/trace.db to output/viz.html and open it
@@ -53,7 +53,7 @@ widths are checked against `ROW_SIZE`. Update them there if `Row` or the interna
 node layout changes.
 
 ```bash
-make trace              # trace a default two-session run -> output/trace.html
+make trace              # default run: fill the root leaf, then split it -> output/trace.html
 make trace IN=cmds.txt  # your own commands; a line of `---` restarts ./main
 ```
 
@@ -83,7 +83,7 @@ definition appears, or returning a pointer where an integer is expected). Making
 them hard errors keeps a half-wired refactor from producing a binary that builds
 and then misbehaves at runtime.
 
-`make test` must be run from `sqlite/` — `tests/test_db` execs `"./main"` by
+`make test` must be run from `sqlite/` — `tests/test_db.db` execs `"./main"` by
 relative path, so the binary has to sit in the working directory. The tests use
 `output/test.db`; the `test` target creates `output/` first, since `main` opens
 the file with `O_CREAT` but cannot create the directory.
@@ -100,47 +100,69 @@ temporary `argv` check.
 `main.c` is a single-file REPL split into the tutorial's layers, top to bottom:
 
 1. **Input** — `InputBuffer` + `read_input()` wrap `getline()`.
-2. **Front end** — `do_meta_command()` handles `.`-prefixed commands;
-   `prepare_statement()` / `prepare_insert()` parse SQL into a `Statement`
-   (a `StatementType` plus an inline `Row`).
+2. **Front end** — `do_meta_command()` handles `.`-prefixed commands (`.exit`,
+   `.btree`, `.constants`); `prepare_statement()` / `prepare_insert()` parse SQL
+   into a `Statement` (a `StatementType` plus an inline `Row`). `.btree` prints the
+   whole tree through `print_tree()`, which recurses from page 0 and uses
+   `indent()` for nesting.
 3. **Virtual machine** — `execute_statement()` dispatches to `execute_insert` /
    `execute_select` against a `Table`.
-4. **Cursor** — a `Cursor` (a `Table *`, a `row_num` and an `end_of_table` flag)
-   is the only way the VM addresses rows. `table_start()` / `table_end()` make one
-   pointing at the first row or one past the last; `cursor_advance()` steps it and
-   raises `end_of_table` on reaching `num_rows`. `execute_insert` writes through a
-   `table_end()` cursor, `execute_select` walks a `table_start()` one until
-   `end_of_table`, and both `free()` it. Cursors are heap-allocated and owned by
-   the caller. This layer exists to give the B-tree somewhere to land: once rows
-   live in a tree, only the cursor internals change and the VM stays as it is.
-5. **Storage** — `Table` holds a row count and a `Pager`. `cursor_value()` maps the
-   cursor's row number to a byte address: `page_num = row_num / ROWS_PER_PAGE`, then
-   `row_offset * ROW_SIZE` within the page. (This is the tutorial's `row_slot()`,
-   renamed once the cursor took over addressing.) `serialize_row` / `deserialize_row`
-   move the `Row` struct to and from a compact on-page layout via the `*_OFFSET`
-   constants, so page bytes are the on-disk format, not the C struct.
-   `serialize_row` uses `strncpy` (not `memcpy`) for the two string columns so the
-   bytes after each terminator are zero-filled rather than leftover stack garbage —
-   that keeps written pages deterministic instead of leaking uninitialised memory
-   into the file. `id` still goes through `memcpy`; it is not a string.
-6. **Pager** — `pager_open()` / `get_page()` own the file descriptor and a
+4. **Cursor** — a `Cursor` (a `Table *`, a `page_num`, a `cell_num` and an
+   `end_of_table` flag) is the only way the VM addresses rows. `table_find(key)`
+   descends from the root — `internal_node_find()` binary-searches an internal
+   node's keys for the child to follow, `leaf_node_find()` binary-searches a leaf
+   — and returns a cursor at the key, or where it would go to keep the leaf sorted.
+   `execute_insert` uses that cursor (and reports `EXECUTE_DUPLICATE_KEY` if the
+   key is already there); `execute_select` walks a `table_start()` cursor with
+   `cursor_advance()` until `end_of_table`. Both `free()` it: cursors are
+   heap-allocated and owned by the caller. `cursor_value()` turns a position into
+   the address of that cell's row.
+5. **B-tree nodes** — every page is one node. A 6-byte common header holds the
+   node type, an is-root flag and a parent pointer. A **leaf** adds `num_cells` and
+   packs up to `LEAF_NODE_MAX_CELLS` (13) cells of `key` + serialized `Row`. An
+   **internal** node adds `num_keys` and a right-child page number, then
+   (child page, key) cells, where each key is the max key of the child to its
+   left. The `leaf_node_*` / `internal_node_*` accessors are pointer arithmetic
+   into a page; `internal_node_child(n)` returns the header's right child when
+   `n == num_keys`. `serialize_row` / `deserialize_row` move a `Row` to and from
+   the on-page layout via the `*_OFFSET` constants, so page bytes are the on-disk
+   format, not the C struct. `serialize_row` uses `strncpy` (not `memcpy`) for the
+   two string columns so the bytes after each terminator are zero-filled rather
+   than leftover stack garbage, keeping written pages deterministic. `id` still
+   goes through `memcpy`; it is not a string.
+6. **Insert and split** — `leaf_node_insert()` shifts later cells right and writes
+   the new one. When the leaf is full it calls `leaf_node_split_and_insert()`,
+   which moves the upper `LEAF_NODE_RIGHT_SPLIT_COUNT` (7) cells into a new leaf
+   on `get_unused_page_num()` (always the end of the file, no free-page reuse) and
+   keeps `LEAF_NODE_LEFT_SPLIT_COUNT` (7) in place. If the split leaf was the root,
+   `create_new_root()` copies it to another new page as the left child and
+   rewrites page 0 as an internal node over the two leaves, so the root always
+   stays on page 0. Splitting a non-root leaf (updating its parent) is not
+   implemented yet and exits with `Need to implement updating parent after split`.
+7. **Pager** — `pager_open()` / `get_page()` own the file descriptor and a
    `TABLE_MAX_PAGES` array of lazily-allocated 4K page caches; a page is read
-   from disk only on first touch (cache miss).
-7. **Persistence** — `db_open()` builds the pager and derives `num_rows` from the
-   file length. `.exit` routes through `do_meta_command(input_buffer, table)` to
-   `db_close()`, which flushes each cached page with `pager_flush()`, closes the
-   fd and frees everything. `pager_flush` takes a byte count rather than always
-   writing `PAGE_SIZE`, because rows are packed tightly and the last page is
-   usually partial. There is no `free_table()` any more — `db_close()` replaced it.
+   from disk only on first touch (cache miss), and touching a page past the end
+   grows `num_pages`. The file must be a whole number of pages.
+8. **Persistence** — `db_open()` builds the pager and a `Table` (a `Pager` plus
+   `root_page_num`, always 0); a new file gets page 0 initialized as an empty root
+   leaf. `.exit` routes through `do_meta_command(input_buffer, table)` to
+   `db_close()`, which flushes every cached page in full with `pager_flush()`,
+   closes the fd and frees everything. Nothing is written before `.exit`, so a run
+   that dies on an `exit()` (such as the split-under-a-parent case) leaves the file
+   as it was.
 
 Every layer returns a result enum (`MetaCommandResult`, `PrepareResult`,
-`ExecuteResult`) rather than printing or exiting; the `switch` statements in
-`main()` are the only place user-facing error strings live. Keep new failure
-modes as enum variants handled there — the tests assert on exact output lines.
+`ExecuteResult`) rather than printing; the `switch` statements in `main()` are
+the only place user-facing error strings live. Keep new failure modes as enum
+variants handled there — the tests assert on exact output lines. The exceptions
+are the tutorial's unimplemented-path stubs ("Need to implement …"), which
+`printf` and `exit()` in place, and the tests assert on those too.
+`EXECUTE_TABLE_FULL` is still defined and handled but no longer returned.
 
 Fixed limits that the tests depend on: `COLUMN_USERNAME_SIZE` 32,
-`COLUMN_EMAIL_SIZE` 255, `PAGE_SIZE` 4096, `TABLE_MAX_PAGES` 100, giving
-1400 max rows (the table-full test inserts 1401).
+`COLUMN_EMAIL_SIZE` 255 (so `ROW_SIZE` 293, `LEAF_NODE_CELL_SIZE` 297),
+`PAGE_SIZE` 4096, `LEAF_NODE_MAX_CELLS` 13, `TABLE_MAX_PAGES` 100. The
+`.constants` test checks those layout sizes exactly.
 
 ### Tests
 
@@ -149,33 +171,54 @@ RSpec suite) with no framework. `run_script()` forks `./main`, pipes a script to
 its stdin and captures stdout, then `expect_output()` compares the captured
 lines against expected ones exactly — including the `db > ` prompt fragments,
 which is why expected lines look like `"db > Executed."` and the last line is a
-bare `"db > "`.
+bare `"db > "` (or the stub message, when the run ends on an `exit()`).
 
 Writes and reads are interleaved through `poll()` on purpose: writing the whole
 script first deadlocks once it exceeds the 64K pipe buffer (the table-full test
 sends ~59K). Preserve that when touching the harness.
 
 `expect_line()` accepts negative indices (counting from the end), matching the
-tutorial's `result[-2]`.
+tutorial's `result[-2]`. `drop_lines(output, n)` returns a view without the first
+`n` lines, for the tutorial's `result[14...result.length]`; it shares the
+original's buffer, so only the original is freed.
 
 Because the REPL is file-backed, each `test_*()` starts with `delete_db()` (the
 port of the RSpec suite's `before` hook running `rm -rf test.db`) and `run_script()` execs
 `./main output/test.db`. `delete_db()` is deliberately called per test rather than inside
 `run_script()`, so a test can run the REPL twice against the same file — which is
 exactly what `test_keeps_data_after_closing_connection()` does to prove rows
-survive a restart. A single RSpec example that calls `run_script` twice becomes two
-`expect_output()` assertions here, so that one test reports as two.
+survive a restart. A single RSpec example that calls `run_script` twice, or checks
+two separate lines, becomes two assertions here, so that one test reports as two.
+
+The table-full test keeps the tutorial's 1401 inserts even though the run now
+stops much earlier: it is the test that pushes the harness past the 64K pipe
+buffer, and later tutorial parts grow the tree until it hits `TABLE_MAX_PAGES`.
+It checks the last two lines — `db > Executed.` and, for now,
+`db > Need to implement updating parent after split` — and that expected last
+line changes as each missing piece lands.
 
 ### Current state
 
-File-backed persistence and the cursor abstraction are both done, and the suite is
-green: 9 tests, 0 failures (`make test`). The cursor change is a pure refactor —
-it added no behaviour and no test, which is why the count did not move.
+The tutorial is through *Splitting a Leaf Node* and recursive search of internal
+nodes: rows live in a B-tree, a full root leaf splits into an internal root over
+two leaves, and inserts and lookups descend through internal nodes. The suite is
+green: 11 assertions from 8 `test_*()` functions, 0 failures (`make test`).
 
 Every function in `main.c` carries a comment describing what it does; keep that up
-when adding new ones.
+when adding new ones (`trace.py` shows them, and only reads `//` lines directly
+above the function).
 
-The next step in the tutorial is replacing the append-only row array with a
-B-tree, which is what the "should not be needed after we switch to a B-tree"
-comment in `db_close()` refers to. Rows are addressed only through the cursor now,
-so that work is mostly confined to the cursor and pager layers.
+Known gaps, left as the tutorial leaves them at this point:
+
+- `execute_select` scans only from `table_start()`, which reads the root as a
+  leaf, so `select` is wrong once the root is internal.
+- `execute_insert`'s duplicate-key check reads the root page as a leaf rather than
+  the leaf `table_find()` landed on.
+- In `leaf_node_split_and_insert`, the new row is serialized at the start of its
+  cell instead of at `leaf_node_value()`, and its key is not written; it only
+  looks right because `id` equals the key.
+- Splitting a non-root leaf exits (see layer 6), which caps the table at three
+  nodes for now.
+
+The next tutorial step is updating the parent after a split, which removes that
+`exit()` and lets the tree grow past two leaves.
