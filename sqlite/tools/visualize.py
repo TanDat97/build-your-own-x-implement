@@ -40,6 +40,7 @@ NODE_INTERNAL, NODE_LEAF = 0, 1
 REGIONS = {
     "common": ("common header", "node type (1 B), is_root (1 B), parent pointer (4 B)"),
     "ncells": ("num_cells / num_keys", "how many cells a leaf holds, or keys an internal node holds (uint32)"),
+    "next": ("next_leaf", "leaf node: page number of the right sibling leaf (uint32), 0 for the rightmost leaf"),
     "child": ("child page", "internal node: page number of a child (uint32); the right child sits in the header"),
     "key": ("key", "cell key (uint32): the row id in a leaf, the left child's max key in an internal node"),
     "id": ("row.id", "serialized Row: id (uint32)"),
@@ -119,15 +120,15 @@ def parse_internal(page, c):
 
 
 def parse_leaf(page, c):
-    """A leaf node: num_cells in the header, then (key, row) cells."""
+    """A leaf node: num_cells and next_leaf in the header, then (key, row) cells."""
     hdr = c["LEAF_NODE_HEADER_SIZE"]
     common = c["COMMON_NODE_HEADER_SIZE"]
     cell_size = c["LEAF_NODE_CELL_SIZE"]
     node_type, is_root = page[0], page[1]
-    parent, num_cells = struct.unpack_from("<II", page, 2)
+    parent, num_cells, next_leaf = struct.unpack_from("<III", page, 2)
     shown = min(num_cells, c["LEAF_NODE_MAX_CELLS"])
 
-    regions = [("common", 0, common), ("ncells", common, hdr)]
+    regions = [("common", 0, common), ("ncells", common, common + 4), ("next", common + 4, hdr)]
     cells = []
     for i in range(shown):
         start = hdr + i * cell_size
@@ -146,7 +147,7 @@ def parse_leaf(page, c):
     end = hdr + shown * cell_size
     regions.append(("free", end, PAGE_SIZE))
     return dict(kind="leaf", node_type=node_type, is_root=is_root, parent=parent,
-                num_cells=num_cells, cells=cells, regions=regions, header=hdr, used=end)
+                num_cells=num_cells, next_leaf=next_leaf, cells=cells, regions=regions, header=hdr, used=end)
 
 
 def region_tip(kind, a, b, cell=None):
@@ -238,6 +239,7 @@ def render_page(num, page, c):
     <div><b>{p['node_type']}</b><span>node type (leaf)</span></div>
     <div><b>{p['is_root']}</b><span>is_root</span></div>
     <div><b>{p['parent']}</b><span>parent</span></div>
+    <div><b>{p['next_leaf'] or '—'}</b><span>next_leaf{' (rightmost)' if not p['next_leaf'] else ''}</span></div>
   </div>
   <h3>Byte layout (4096 B, hover a segment)</h3>
   {render_bar(p)}
@@ -287,6 +289,7 @@ def render_internal(num, page, p, c):
 def render_tree(pages, c):
     """The tree from page 0 down, in the same shape `.btree` prints it."""
     lines = []
+    leaves = []
 
     def walk(num, level, seen):
         pad = "  " * level
@@ -297,7 +300,9 @@ def render_tree(pages, c):
         p = parse_page(pages[num], c)
         if p["kind"] == "leaf":
             keys = ", ".join(str(x["key"]) for x in p["cells"])
-            lines.append(f"{pad}- leaf (size {p['num_cells']}) · page {num}: {keys}")
+            nxt = f"page {p['next_leaf']}" if p["next_leaf"] else "end"
+            lines.append(f"{pad}- leaf (size {p['num_cells']}) · page {num}: {keys} · next → {nxt}")
+            leaves.append(num)
             return
         lines.append(f"{pad}- internal (size {p['num_keys']}) · page {num}")
         for x in p["cells"]:
@@ -307,15 +312,38 @@ def render_tree(pages, c):
 
     if pages:
         walk(0, 0, frozenset())
+        lines += ["", "Leaf chain, as select walks it (next_leaf from the leftmost leaf):",
+                  "  " + leaf_chain(pages, c, leaves[0] if leaves else 0)]
     return html.escape("\n".join(lines)) or "The file has no pages yet."
+
+
+def leaf_chain(pages, c, start):
+    """Follow next_leaf from `start`, the way cursor_advance() does."""
+    chain, seen, num = [], set(), start
+    while True:
+        if num >= len(pages) or num in seen:
+            chain.append(f"page {num}: {'loop' if num in seen else 'not in the file'}")
+            break
+        seen.add(num)
+        p = parse_page(pages[num], c)
+        if p["kind"] != "leaf":
+            chain.append(f"page {num}: not a leaf")
+            break
+        chain.append(f"page {num} ({p['num_cells']})")
+        if not p["next_leaf"]:
+            chain.append("end")
+            break
+        num = p["next_leaf"]
+    return " → ".join(chain)
 
 
 LAYERS = [
     ("Input", "read_input()", "one line from stdin"),
     ("Front end", "do_meta_command() · prepare_statement()", "text → Statement; no data touched"),
     ("Virtual machine", "execute_insert() · execute_select()", "talks only to a Cursor"),
-    ("Cursor", "table_start() · table_find() · leaf_node_find() · cursor_advance() · cursor_value()",
-     "a finger on (page_num, cell_num)"),
+    ("Cursor", "table_start() · table_find() · internal_node_find() · leaf_node_find() · "
+     "cursor_advance() · cursor_value()",
+     "a finger on (page_num, cell_num); a scan follows next_leaf from leaf to leaf"),
     ("B-tree node", "leaf_node_insert() · leaf_node_split_and_insert() · create_new_root() · "
      "leaf_node_*() · internal_node_*()",
      "pointer arithmetic inside one page; a full leaf splits"),
@@ -354,7 +382,7 @@ TEMPLATE = """<!doctype html>
   color-scheme: light;
   --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
   --grid: #e1e0d9; --ring: rgba(11,11,11,0.10);
-  --c-common: #2a78d6; --c-ncells: #eb6834; --c-child: #7a5bd1; --c-key: #1baf7a;
+  --c-common: #2a78d6; --c-ncells: #eb6834; --c-child: #7a5bd1; --c-next: #0f8fa3; --c-key: #1baf7a;
   --c-id: #eda100; --c-user: #e87ba4; --c-email: #008300; --c-free: #e1e0d9;
 }}
 @media (prefers-color-scheme: dark) {{
@@ -362,7 +390,7 @@ TEMPLATE = """<!doctype html>
     color-scheme: dark;
     --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
     --grid: #2c2c2a; --ring: rgba(255,255,255,0.10);
-    --c-common: #3987e5; --c-ncells: #d95926; --c-child: #8f73e0; --c-key: #199e70;
+    --c-common: #3987e5; --c-ncells: #d95926; --c-child: #8f73e0; --c-next: #22a3b8; --c-key: #199e70;
     --c-id: #c98500; --c-user: #d55181; --c-email: #008300; --c-free: #2c2c2a;
   }}
 }}
@@ -401,7 +429,7 @@ th {{ color: var(--ink-2); font-weight: 600; font-size: 12px; }}
 .seg {{ min-width: 2px; border-radius: 4px; cursor: default; }}
 .seg:hover {{ outline: 2px solid var(--ink); outline-offset: 1px; }}
 .r-common {{ background: var(--c-common); }} .r-ncells {{ background: var(--c-ncells); }}
-.r-child {{ background: var(--c-child); }}
+.r-child {{ background: var(--c-child); }} .r-next {{ background: var(--c-next); }}
 .r-key {{ background: var(--c-key); }} .r-id {{ background: var(--c-id); }}
 .r-user {{ background: var(--c-user); }} .r-email {{ background: var(--c-email); }}
 .r-free {{ background: var(--c-free); }}
@@ -417,12 +445,12 @@ th {{ color: var(--ink-2); font-weight: 600; font-size: 12px; }}
 .hexes {{ display: inline-grid; grid-template-columns: repeat(16, 2.4ch); }}
 .hx {{ cursor: default; }}
 .t-common {{ color: var(--c-common); }} .t-ncells {{ color: var(--c-ncells); }}
-.t-child {{ color: var(--c-child); }}
+.t-child {{ color: var(--c-child); }} .t-next {{ color: var(--c-next); }}
 .t-key {{ color: var(--c-key); }} .t-id {{ color: var(--c-id); }}
 .t-user {{ color: var(--c-user); }} .t-email {{ color: var(--c-email); }}
 .t-free {{ color: var(--muted); }}
 .zero {{ opacity: 0.35; }}
-.hx.t-common, .hx.t-ncells, .hx.t-child, .hx.t-key, .hx.t-id, .hx.t-user, .hx.t-email {{ font-weight: 700; }}
+.hx.t-common, .hx.t-ncells, .hx.t-next, .hx.t-child, .hx.t-key, .hx.t-id, .hx.t-user, .hx.t-email {{ font-weight: 700; }}
 #tip {{ position: fixed; pointer-events: none; background: var(--surface); color: var(--ink);
   border: 1px solid var(--ring); border-radius: 6px; padding: 6px 10px; font-size: 12px;
   box-shadow: 0 4px 16px rgba(0,0,0,0.15); max-width: 360px; display: none; z-index: 10; }}

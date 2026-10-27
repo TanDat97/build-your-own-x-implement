@@ -45,9 +45,9 @@ tools. `viz.html` and `trace.html` describe the same file, `output/trace.db`:
 
 `make viz` runs `tools/visualize.py`, which reads the layout sizes from
 `./main`'s `.constants` (run against a temp copy, so the db is not rewritten),
-prints the tree from page 0 the way `.btree` does, and draws each page as a leaf
-or internal node (by its node-type byte): byte-layout bar, cell table,
-colour-coded hex dump. `.constants` only prints leaf sizes, so the Row field
+prints the tree from page 0 the way `.btree` does (plus each leaf's `next_leaf`
+and the leaf chain `select` walks), and draws each page as a leaf or internal node
+(by its node-type byte): byte-layout bar, cell table, colour-coded hex dump. `.constants` only prints leaf sizes, so the Row field
 widths and the internal-node layout are mirrored at the top of the script; the Row
 widths are checked against `ROW_SIZE`. Update them there if `Row` or the internal
 node layout changes.
@@ -67,7 +67,11 @@ filmstrip of the tree, with each function's description taken from the comment
 above it — another reason to keep those comments current. The layer grouping in
 `LAYERS` at the top of `trace.py` is manual; unlisted functions show as "Other".
 The tree walk starts at page 0 and draws internal nodes: `trace_gdb.py` parses
-them from the tutorial's `INTERNAL_NODE_*` constants and the node-type byte. The
+them from the tutorial's `INTERNAL_NODE_*` constants and the node-type byte. Each
+leaf's `next_leaf` (read at `LEAF_NODE_NEXT_LEAF_OFFSET`) is drawn as a dashed
+arrow to its sibling, and `cursor_advance()` calls are annotated when they cross to
+the next leaf or reach the end. The default run ends with a `select` over both
+leaves after the split. The
 insert cursor is read from `table_find()`'s return value. gdb exits 0 even when
 `trace_gdb.py` raises (the exception just halts `./main` mid-run), so `trace.py`
 scans gdb's stderr for `Python Exception` and fails loudly instead of rendering a
@@ -113,13 +117,18 @@ temporary `argv` check.
    node's keys for the child to follow, `leaf_node_find()` binary-searches a leaf
    — and returns a cursor at the key, or where it would go to keep the leaf sorted.
    `execute_insert` uses that cursor (and reports `EXECUTE_DUPLICATE_KEY` if the
-   key is already there); `execute_select` walks a `table_start()` cursor with
-   `cursor_advance()` until `end_of_table`. Both `free()` it: cursors are
+   key is already there). `table_start()` is `table_find(0)`: key 0 is below every
+   id, so it lands on cell 0 of the leftmost leaf. `execute_select` walks that
+   cursor with `cursor_advance()`, which steps through a leaf's cells and then
+   follows its `next_leaf` page to the next leaf, setting `end_of_table` after
+   the rightmost one (`next_leaf` 0). Both `free()` the cursor: cursors are
    heap-allocated and owned by the caller. `cursor_value()` turns a position into
    the address of that cell's row.
 5. **B-tree nodes** — every page is one node. A 6-byte common header holds the
    node type, an is-root flag and a parent pointer. A **leaf** adds `num_cells` and
-   packs up to `LEAF_NODE_MAX_CELLS` (13) cells of `key` + serialized `Row`. An
+   `next_leaf` (14-byte header) — the page number of its right sibling, 0 for
+   the rightmost leaf (page 0 is always the root, so 0 can never be a sibling) —
+   and packs up to `LEAF_NODE_MAX_CELLS` (13) cells of `key` + serialized `Row`. An
    **internal** node adds `num_keys` and a right-child page number, then
    (child page, key) cells, where each key is the max key of the child to its
    left. The `leaf_node_*` / `internal_node_*` accessors are pointer arithmetic
@@ -134,7 +143,10 @@ temporary `argv` check.
    the new one. When the leaf is full it calls `leaf_node_split_and_insert()`,
    which moves the upper `LEAF_NODE_RIGHT_SPLIT_COUNT` (7) cells into a new leaf
    on `get_unused_page_num()` (always the end of the file, no free-page reuse) and
-   keeps `LEAF_NODE_LEFT_SPLIT_COUNT` (7) in place. If the split leaf was the root,
+   keeps `LEAF_NODE_LEFT_SPLIT_COUNT` (7) in place. The new leaf takes over the
+   old leaf's `next_leaf` and the old leaf points at the new one, so the leaves
+   stay a left-to-right linked list. The new row is written at
+   `leaf_node_value()` and its key set explicitly, like any other cell. If the split leaf was the root,
    `create_new_root()` copies it to another new page as the left child and
    rewrites page 0 as an internal node over the two leaves, so the root always
    stays on page 0. Splitting a non-root leaf (updating its parent) is not
@@ -161,7 +173,8 @@ are the tutorial's unimplemented-path stubs ("Need to implement …"), which
 
 Fixed limits that the tests depend on: `COLUMN_USERNAME_SIZE` 32,
 `COLUMN_EMAIL_SIZE` 255 (so `ROW_SIZE` 293, `LEAF_NODE_CELL_SIZE` 297),
-`PAGE_SIZE` 4096, `LEAF_NODE_MAX_CELLS` 13, `TABLE_MAX_PAGES` 100. The
+`PAGE_SIZE` 4096, `LEAF_NODE_HEADER_SIZE` 14 (so `LEAF_NODE_SPACE_FOR_CELLS`
+4082), `LEAF_NODE_MAX_CELLS` 13, `TABLE_MAX_PAGES` 100. The
 `.constants` test checks those layout sizes exactly.
 
 ### Tests
@@ -179,7 +192,8 @@ sends ~59K). Preserve that when touching the harness.
 
 `expect_line()` accepts negative indices (counting from the end), matching the
 tutorial's `result[-2]`. `drop_lines(output, n)` returns a view without the first
-`n` lines, for the tutorial's `result[14...result.length]`; it shares the
+`n` lines, for the tutorial's `result[14...result.length]` (the 3-leaf `.btree`
+test and the multi-level `select` test both use it); it shares the
 original's buffer, so only the original is freed.
 
 Because the REPL is file-backed, each `test_*()` starts with `delete_db()` (the
@@ -199,10 +213,11 @@ line changes as each missing piece lands.
 
 ### Current state
 
-The tutorial is through *Splitting a Leaf Node* and recursive search of internal
-nodes: rows live in a B-tree, a full root leaf splits into an internal root over
-two leaves, and inserts and lookups descend through internal nodes. The suite is
-green: 11 assertions from 8 `test_*()` functions, 0 failures (`make test`).
+The tutorial is through *Scanning a Multi-Level B-Tree*: rows live in a B-tree,
+a full root leaf splits into an internal root over two linked leaves, inserts and
+lookups descend through internal nodes, and `select` scans every leaf in key
+order. The suite is green: 12 assertions from 9 `test_*()` functions, 0 failures
+(`make test`).
 
 Every function in `main.c` carries a comment describing what it does; keep that up
 when adding new ones (`trace.py` shows them, and only reads `//` lines directly
@@ -210,13 +225,8 @@ above the function).
 
 Known gaps, left as the tutorial leaves them at this point:
 
-- `execute_select` scans only from `table_start()`, which reads the root as a
-  leaf, so `select` is wrong once the root is internal.
 - `execute_insert`'s duplicate-key check reads the root page as a leaf rather than
   the leaf `table_find()` landed on.
-- In `leaf_node_split_and_insert`, the new row is serialized at the start of its
-  cell instead of at `leaf_node_value()`, and its key is not written; it only
-  looks right because `id` equals the key.
 - Splitting a non-root leaf exits (see layer 6), which caps the table at three
   nodes for now.
 

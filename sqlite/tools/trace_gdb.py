@@ -37,7 +37,8 @@ def const(name):
 
 def consts():
     if state["consts"] is None:
-        names = ["PAGE_SIZE", "LEAF_NODE_NUM_CELLS_OFFSET", "LEAF_NODE_HEADER_SIZE",
+        names = ["PAGE_SIZE", "LEAF_NODE_NUM_CELLS_OFFSET", "LEAF_NODE_NEXT_LEAF_OFFSET",
+                 "LEAF_NODE_HEADER_SIZE",
                  "LEAF_NODE_CELL_SIZE", "LEAF_NODE_KEY_SIZE", "LEAF_NODE_MAX_CELLS",
                  "ID_OFFSET", "USERNAME_OFFSET", "EMAIL_OFFSET", "USERNAME_SIZE", "EMAIL_SIZE"]
         state["consts"] = {n: const(n) for n in names}
@@ -103,8 +104,9 @@ def parse_internal(data, c):
 
 
 def parse_leaf(data, c):
-    """A leaf node: its cell count and every cell's key + row."""
+    """A leaf node: its cell count, its next_leaf sibling and every cell's key + row."""
     n = struct.unpack_from("<I", data, c["LEAF_NODE_NUM_CELLS_OFFSET"])[0]
+    next_leaf = struct.unpack_from("<I", data, c["LEAF_NODE_NEXT_LEAF_OFFSET"])[0]
     cells = []
     for i in range(min(n, c["LEAF_NODE_MAX_CELLS"])):
         start = c["LEAF_NODE_HEADER_SIZE"] + i * c["LEAF_NODE_CELL_SIZE"]
@@ -116,7 +118,8 @@ def parse_leaf(data, c):
         cells.append({"offset": start, "key": key, "id": rid,
                       "username": cstr(data[u:u + c["USERNAME_SIZE"]]),
                       "email": cstr(data[e:e + c["EMAIL_SIZE"]])})
-    return {"num_cells": n, "cells": cells, "max_cells": c["LEAF_NODE_MAX_CELLS"]}
+    return {"num_cells": n, "next_leaf": next_leaf, "cells": cells,
+            "max_cells": c["LEAF_NODE_MAX_CELLS"]}
 
 
 def read_disk():
@@ -311,6 +314,13 @@ def on_return(call, rv):
                                      f"{', '.join(map(str, node['children']))}")
             else:
                 call["notes"].append(f"page {cur['page_num']} now has {node['num_cells']} cell(s)")
+    if fn == "cursor_advance":
+        # The cursor as cursor_advance() left it (the args hold its state on entry).
+        cur = next((d for n, _, d in call.get("after", []) if n == "cursor"), None)
+        if cur and cur.get("end_of_table"):
+            call["notes"].append("end_of_table: that was the rightmost leaf (next_leaf 0)")
+        elif cur and cur.get("cell_num") == 0:
+            call["notes"].append(f"followed next_leaf to page {cur['page_num']}")
     if fn == "pager_flush":
         snapshot("after pager_flush")
     if fn == "db_close":

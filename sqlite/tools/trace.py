@@ -38,11 +38,12 @@ def insert(i):
 
 # Session 1 fills the root leaf to LEAF_NODE_MAX_CELLS (13). Session 2 reloads it
 # from disk, and the 14th insert splits it: the root becomes an internal node over
-# two leaves. The 15th insert is then routed through that internal node. Session 2
-# has no `select`, since table_start() still reads the root as a leaf.
+# two leaves linked by next_leaf. The 15th insert is then routed through that
+# internal node, and the closing `select` scans both leaves, crossing from one to
+# the next in cursor_advance().
 DEFAULT_SESSIONS = [
     [insert(i) for i in range(1, 14)] + ["select", ".btree", ".exit"],
-    [insert(14), ".btree", insert(15), ".btree", ".exit"],
+    [insert(14), ".btree", insert(15), ".btree", "select", ".exit"],
 ]
 
 # Layer of each function, in the order data flows through them. Functions not
@@ -52,11 +53,11 @@ LAYERS = [
     ("Front end", ["do_meta_command", "prepare_statement", "prepare_insert",
                    "print_constants", "print_tree", "indent"]),
     ("Virtual machine", ["execute_statement", "execute_insert", "execute_select", "print_row"]),
-    ("Cursor", ["table_start", "table_find", "leaf_node_find", "cursor_value",
+    ("Cursor", ["table_start", "table_find", "internal_node_find", "leaf_node_find", "cursor_value",
                 "cursor_advance"]),
     ("B-tree node / row", ["leaf_node_insert", "leaf_node_split_and_insert", "create_new_root",
                            "leaf_node_num_cells", "leaf_node_cell", "leaf_node_key",
-                           "leaf_node_value", "initialize_leaf_node",
+                           "leaf_node_value", "leaf_node_next_leaf", "initialize_leaf_node",
                            "internal_node_num_keys", "internal_node_right_child",
                            "internal_node_cell", "internal_node_child", "internal_node_key",
                            "initialize_internal_node", "get_node_type", "set_node_type",
@@ -69,6 +70,7 @@ LAYER_OF = {fn: i for i, (_, fns) in enumerate(LAYERS) for fn in fns}
 # Pure pointer arithmetic and header-byte accessors, hidden by default to keep the
 # call tree readable.
 HELPERS = {"leaf_node_num_cells", "leaf_node_cell", "leaf_node_key", "leaf_node_value",
+           "leaf_node_next_leaf",
            "internal_node_num_keys", "internal_node_right_child", "internal_node_cell",
            "internal_node_child", "internal_node_key", "get_node_type", "set_node_type",
            "is_node_root", "set_node_root"}
@@ -443,10 +445,30 @@ def render_tree(tree, new_keys, cursor=None, mini=False):
     height = TOP + (depth_of(tree) - 1) * LEVEL_H + NODE_H + (8 if mini else 34)
     out = []
     draw_node(tree, new_keys, cursor, mini, out)
+    draw_siblings(tree, out)
     top = 0 if not mini else TOP - 6
     return (f'<svg class="bt{" mini" if mini else ""}" viewBox="-4 {top} {width + 8} {height - top}" '
             f'width="{width + 8}" height="{height - top}" role="img" '
             f'aria-label="B-tree rooted at page {tree["page"]}">{"".join(out)}</svg>')
+
+
+def draw_siblings(tree, out):
+    """A dashed arrow from each leaf to its next_leaf, the path a select scan takes."""
+    leaves, stack = {}, [tree]
+    while stack:
+        t = stack.pop()
+        if t["node"].get("kind") != "internal":
+            leaves[t["page"]] = t
+        stack += t["children"]
+    for t in leaves.values():
+        nxt = leaves.get(t["node"].get("next_leaf"))
+        if not nxt or nxt is t:
+            continue
+        y = t["y"] + NODE_H / 2
+        x1, x2 = t["x"] + t["w"] + 2, nxt["x"] - 4
+        tip = esc(f"page {t['page']} next_leaf = {nxt['page']}: cursor_advance() continues there")
+        out.append(f'<g data-tip="{tip}"><line class="bt-next" x1="{x1}" y1="{y}" x2="{x2}" y2="{y}"/>'
+                   f'<path class="bt-next-head" d="M{x2 + 4} {y} l-6 -4 v8 z"/></g>')
 
 
 def tree_caption(tree, exited):
@@ -687,6 +709,8 @@ svg.bt {{ display: block; max-width: 100%; height: auto; overflow: visible; }}
 .bt-free {{ fill: var(--muted); font-size: 11px; text-anchor: middle; }}
 .bt-label {{ fill: var(--ink-2); font-size: 11px; }}
 .bt-edge {{ stroke: var(--muted); stroke-width: 1.5; }}
+.bt-next {{ stroke: var(--ink-2); stroke-width: 1.5; stroke-dasharray: 4 3; }}
+.bt-next-head {{ fill: var(--ink-2); }}
 .bt-cursor {{ fill: var(--ink); }}
 .bt-cursor-label {{ fill: var(--ink); font-size: 11px; }}
 .strip {{ display: flex; align-items: center; gap: 8px; overflow-x: auto; padding-bottom: 6px; }}

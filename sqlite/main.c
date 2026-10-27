@@ -112,9 +112,11 @@ const uint8_t COMMON_NODE_HEADER_SIZE = NODE_TYPE_SIZE + IS_ROOT_SIZE + PARENT_P
 /*
  * Leaf Node Header Layout
  */
-const uint32_t LEAF_NODE_NUM_CELLS_SIZE = sizeof(uint32_t);                                // 4 bytes for number of cells
-const uint32_t LEAF_NODE_NUM_CELLS_OFFSET = COMMON_NODE_HEADER_SIZE;                       // number of cells is stored right after the common node header
-const uint32_t LEAF_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE + LEAF_NODE_NUM_CELLS_SIZE; // total size of the leaf node header (6 + 4 = 10 bytes)
+const uint32_t LEAF_NODE_NUM_CELLS_SIZE = sizeof(uint32_t);                                                           // 4 bytes for number of cells
+const uint32_t LEAF_NODE_NUM_CELLS_OFFSET = COMMON_NODE_HEADER_SIZE;                                                  // number of cells is stored right after the common node header
+const uint32_t LEAF_NODE_NEXT_LEAF_SIZE = sizeof(uint32_t);                                                           // 4 bytes for the next leaf pointer (page number of the next leaf node)
+const uint32_t LEAF_NODE_NEXT_LEAF_OFFSET = LEAF_NODE_NUM_CELLS_OFFSET + LEAF_NODE_NUM_CELLS_SIZE;                    // next leaf pointer is stored right after the number of cells
+const uint32_t LEAF_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE + LEAF_NODE_NUM_CELLS_SIZE + LEAF_NODE_NEXT_LEAF_SIZE; // total size of the leaf node header (6 + 4 + 4 = 14 bytes)
 
 /*
  * Leaf Node Body Layout
@@ -124,8 +126,8 @@ const uint32_t LEAF_NODE_KEY_OFFSET = 0;                                        
 const uint32_t LEAF_NODE_VALUE_SIZE = ROW_SIZE;                                       // size of the value is the size of a row (293 bytes)
 const uint32_t LEAF_NODE_VALUE_OFFSET = LEAF_NODE_KEY_OFFSET + LEAF_NODE_KEY_SIZE;    // value is stored right after the key
 const uint32_t LEAF_NODE_CELL_SIZE = LEAF_NODE_KEY_SIZE + LEAF_NODE_VALUE_SIZE;       // 4 bytes for key + 293 bytes for value = 297 bytes per cell
-const uint32_t LEAF_NODE_SPACE_FOR_CELLS = PAGE_SIZE - LEAF_NODE_HEADER_SIZE;         // Space available for cells in a leaf node (4096 - 10 = 4086 bytes)
-const uint32_t LEAF_NODE_MAX_CELLS = LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE; // Maximum number of cells in a leaf node (4086 / 297 = 13 cells)
+const uint32_t LEAF_NODE_SPACE_FOR_CELLS = PAGE_SIZE - LEAF_NODE_HEADER_SIZE;         // Space available for cells in a leaf node (4096 - 14 = 4082 bytes)
+const uint32_t LEAF_NODE_MAX_CELLS = LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE; // Maximum number of cells in a leaf node (4082 / 297 = 13 cells)
 
 const uint32_t LEAF_NODE_RIGHT_SPLIT_COUNT = (LEAF_NODE_MAX_CELLS + 1) / 2;                          // When splitting a leaf node, the right node gets half of the cells (7 cells)
 const uint32_t LEAF_NODE_LEFT_SPLIT_COUNT = (LEAF_NODE_MAX_CELLS + 1) - LEAF_NODE_RIGHT_SPLIT_COUNT; // When splitting a leaf node, the left node gets the other half of the cells (7 cells)
@@ -200,13 +202,20 @@ void *leaf_node_value(void *node, uint32_t cell_num)
   return leaf_node_cell(node, cell_num) + LEAF_NODE_KEY_SIZE;
 }
 
+// Return a pointer to the next-leaf page number, stored in the leaf header after the cell count. This is a page number, not a byte address.
+uint32_t *leaf_node_next_leaf(void *node)
+{
+  return node + LEAF_NODE_NEXT_LEAF_OFFSET;
+}
+
 // Turn a fresh page into an empty leaf node: mark its type as NODE_LEAF, clear the
-// is-root flag and zero its cell count.
+// is-root flag, zero its cell count and set next_leaf to 0 (no right sibling).
 void initialize_leaf_node(void *node)
 {
   set_node_type(node, NODE_LEAF);
   set_node_root(node, false);
   *leaf_node_num_cells(node) = 0;
+  *leaf_node_next_leaf(node) = 0; // initialize the next leaf pointer to 0 (no next leaf)
 }
 
 // Return a pointer to the internal node's key count, stored in its header right after
@@ -414,23 +423,6 @@ void print_row(Row *row)
   printf("(%d, %s, %s)\n", row->id, row->username, row->email);
 }
 
-// Make a cursor pointing at cell 0 of the root node, for a scan from the beginning.
-// end_of_table is set when the root has no cells, so a caller can loop on it straight
-// away. The cursor is malloc'd; the caller frees it.
-Cursor *table_start(Table *table)
-{
-  Cursor *cursor = malloc(sizeof(Cursor));
-  cursor->table = table;
-  cursor->page_num = table->root_page_num;
-  cursor->cell_num = 0;
-
-  void *root_node = get_page(table->pager, table->root_page_num);
-  uint32_t num_cells = *leaf_node_num_cells(root_node);
-  cursor->end_of_table = (num_cells == 0);
-
-  return cursor;
-}
-
 // Binary-search leaf node `page_num` for `key` and return a cursor at its cell, or, if
 // the key is absent, at the cell where it would be inserted to keep keys sorted.
 // The cursor is malloc'd; the caller frees it.
@@ -473,30 +465,36 @@ Cursor *leaf_node_find(Table *table, uint32_t page_num, uint32_t key)
 // first child whose max key is >= key, else the right child), then recurse into it
 // until a leaf, returning leaf_node_find's cursor there. The cursor is malloc'd; the
 // caller frees it.
-Cursor* internal_node_find(Table* table, uint32_t page_num, uint32_t key) {
-  void* node = get_page(table->pager, page_num);
+Cursor *internal_node_find(Table *table, uint32_t page_num, uint32_t key)
+{
+  void *node = get_page(table->pager, page_num);
   uint32_t num_keys = *internal_node_num_keys(node);
 
   /* Binary search to find index of child to search */
   uint32_t min_index = 0;
   uint32_t max_index = num_keys; /* there is one more child than key */
 
-  while (min_index != max_index) {
+  while (min_index != max_index)
+  {
     uint32_t index = (min_index + max_index) / 2;
     uint32_t key_to_right = *internal_node_key(node, index);
-    if (key_to_right >= key) {
+    if (key_to_right >= key)
+    {
       max_index = index;
-    } else {
+    }
+    else
+    {
       min_index = index + 1;
     }
   }
   uint32_t child_num = *internal_node_child(node, min_index);
-  void* child = get_page(table->pager, child_num);
-  switch (get_node_type(child)) {
-    case NODE_LEAF:
-      return leaf_node_find(table, child_num, key);
-    case NODE_INTERNAL:
-      return internal_node_find(table, child_num, key);
+  void *child = get_page(table->pager, child_num);
+  switch (get_node_type(child))
+  {
+  case NODE_LEAF:
+    return leaf_node_find(table, child_num, key);
+  case NODE_INTERNAL:
+    return internal_node_find(table, child_num, key);
   }
 }
 
@@ -518,6 +516,21 @@ Cursor *table_find(Table *table, uint32_t key)
   }
 }
 
+// Make a cursor at the first row of the table, for a scan from the beginning: searching
+// for key 0 (below every id) descends to cell 0 of the leftmost leaf. end_of_table is
+// set when that leaf has no cells, so a caller can loop on it straight away. The cursor
+// is malloc'd; the caller frees it.
+Cursor *table_start(Table *table)
+{
+  Cursor *cursor = table_find(table, 0); // cursor at the first cell of the leftmost leaf
+
+  void *node = get_page(table->pager, cursor->page_num);
+  uint32_t num_cells = *leaf_node_num_cells(node);
+  cursor->end_of_table = (num_cells == 0);
+
+  return cursor;
+}
+
 // Return the byte address of the row the cursor points at: the value of cell
 // `cell_num` in node `page_num`. This is the one place a cursor position becomes a
 // pointer, so the VM never needs to know about the node layout.
@@ -528,8 +541,9 @@ void *cursor_value(Cursor *cursor)
   return leaf_node_value(page, cursor->cell_num);
 }
 
-// Step the cursor to the next cell in its node, setting end_of_table once it has moved
-// past the node's last cell.
+// Step the cursor to the next cell. Past the leaf's last cell it moves to cell 0 of the
+// leaf's next_leaf, so a scan walks every leaf in key order; end_of_table is set after
+// the rightmost leaf (next_leaf 0).
 void cursor_advance(Cursor *cursor)
 {
   uint32_t page_num = cursor->page_num;
@@ -538,7 +552,18 @@ void cursor_advance(Cursor *cursor)
   cursor->cell_num += 1;
   if (cursor->cell_num >= (*leaf_node_num_cells(node)))
   {
-    cursor->end_of_table = true;
+    /* Advance to next leaf node */
+    uint32_t next_page_num = *leaf_node_next_leaf(node);
+    if (next_page_num == 0)
+    {
+      /* This was rightmost leaf */
+      cursor->end_of_table = true;
+    }
+    else
+    {
+      cursor->page_num = next_page_num;
+      cursor->cell_num = 0;
+    }
   }
 }
 
@@ -824,8 +849,10 @@ void create_new_root(Table *table, uint32_t right_child_page_num)
 }
 
 // Split a full leaf: move the upper half of its cells (plus the new one) into a fresh
-// leaf on a new page, insert the new cell at the cursor's position on whichever side
-// it falls, then create a new root if the old leaf was the root. Exits if it was not,
+// leaf on a new page, linked in after the old leaf (it takes over the old leaf's
+// next_leaf and the old leaf points to it), write the new cell's key and row at the
+// cursor's position on whichever side it falls, then create a new root if the old
+// leaf was the root. Exits if it was not,
 // since updating a parent is not implemented yet.
 void leaf_node_split_and_insert(Cursor *cursor, uint32_t key, Row *value)
 {
@@ -838,6 +865,8 @@ void leaf_node_split_and_insert(Cursor *cursor, uint32_t key, Row *value)
   uint32_t new_page_num = get_unused_page_num(cursor->table->pager);
   void *new_node = get_page(cursor->table->pager, new_page_num);
   initialize_leaf_node(new_node);
+  *leaf_node_next_leaf(new_node) = *leaf_node_next_leaf(old_node); // new node points to the next leaf
+  *leaf_node_next_leaf(old_node) = new_page_num;                   // old node points to the new leaf
 
   /*
   All existing keys plus new key should be divided
@@ -860,7 +889,8 @@ void leaf_node_split_and_insert(Cursor *cursor, uint32_t key, Row *value)
 
     if (i == cursor->cell_num)
     {
-      serialize_row(value, destination);
+      serialize_row(value, leaf_node_value(destination_node, index_within_node));
+      *leaf_node_key(destination_node, index_within_node) = key;
     }
     else if (i > cursor->cell_num)
     {

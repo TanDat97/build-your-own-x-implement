@@ -69,27 +69,30 @@ The layers it is built from — input buffer, statement parser, virtual machine,
 cursor, B-tree nodes and a pager over a fixed-size page cache — mirror the
 structure of real SQLite, at a much smaller scale. Every page is one B-tree node.
 Leaves hold rows sorted by id, internal nodes hold keys and child page numbers, and
-inserts binary-search down from the root to find their leaf. Pages are read from
-the file on first touch and flushed back when the database is closed.
+inserts binary-search down from the root to find their leaf. Each leaf also stores
+the page number of the leaf to its right, so `select` starts at the leftmost leaf
+and follows that chain to return every row in id order. Pages are read from the
+file on first touch and flushed back when the database is closed.
 
 Tests live in `sqlite/tests/test_db.c` and drive the compiled REPL as a black box:
 they pipe a script into its stdin and compare stdout line by line. It is a C port
-of the tutorial's RSpec suite, with no test framework — `make test` runs all 11
+of the tutorial's RSpec suite, with no test framework — `make test` runs all 12
 checks.
 
 Two HTML tools in `sqlite/tools/` show what the code does. `make trace` runs the
 REPL under gdb and records every call, with its arguments and return value, plus
-the page cache and the file after each command. `make viz` draws each page of the
-database file byte by byte. Both write to `sqlite/output/`; `make trace IN=cmds.txt`
+the page cache and the file after each command, and draws the tree after every
+step, with dashed arrows for the leaf-to-leaf links `select` follows. Its default
+run fills the root leaf, splits it, then scans both leaves. `make viz` draws each
+page of the database file byte by byte, including each leaf's `next_leaf` link. Both write to `sqlite/output/`; `make trace IN=cmds.txt`
 traces your own commands.
 
 Progress so far: the REPL and statement parser, file-backed persistence, the
 cursor abstraction, the B-tree leaf format, binary search with duplicate-key
-errors, splitting a full root leaf, and searching through internal nodes. Next is
-updating the parent after a split: until then, a leaf that fills up under an
-internal root ends the program with `Need to implement updating parent after
-split`. `select` also still reads only the root, so it is wrong once the root has
-split.
+errors, splitting a full root leaf, searching through internal nodes, and scanning
+a multi-level tree leaf by leaf. Next is updating the parent after a split: until
+then, a leaf that fills up under an internal root ends the program with `Need to
+implement updating parent after split`.
 
 ## Requirements
 

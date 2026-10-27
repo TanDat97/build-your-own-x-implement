@@ -450,9 +450,9 @@ static void test_prints_constants(void)
       "db > Constants:",
       "ROW_SIZE: 293",
       "COMMON_NODE_HEADER_SIZE: 6",
-      "LEAF_NODE_HEADER_SIZE: 10",
+      "LEAF_NODE_HEADER_SIZE: 14",
       "LEAF_NODE_CELL_SIZE: 297",
-      "LEAF_NODE_SPACE_FOR_CELLS: 4086",
+      "LEAF_NODE_SPACE_FOR_CELLS: 4082",
       "LEAF_NODE_MAX_CELLS: 13",
       "db > ",
   };
@@ -540,6 +540,49 @@ static void test_allows_printing_out_the_structure_of_a_3_leaf_node_btree(void)
   free_output(&result);
 }
 
+static void test_prints_all_rows_in_a_multi_level_tree(void)
+{
+  delete_db();
+
+  const int num_inserts = 15;
+  const char *commands[17];
+  char inserts[15][64];
+
+  for (int i = 1; i <= num_inserts; i++)
+  {
+    snprintf(inserts[i - 1], 64, "insert %d user%d person%d@example.com", i, i, i);
+    commands[i - 1] = inserts[i - 1];
+  }
+  commands[15] = "select";
+  commands[16] = ".exit";
+
+  const char *expected[] = {
+      "db > (1, user1, person1@example.com)",
+      "(2, user2, person2@example.com)",
+      "(3, user3, person3@example.com)",
+      "(4, user4, person4@example.com)",
+      "(5, user5, person5@example.com)",
+      "(6, user6, person6@example.com)",
+      "(7, user7, person7@example.com)",
+      "(8, user8, person8@example.com)",
+      "(9, user9, person9@example.com)",
+      "(10, user10, person10@example.com)",
+      "(11, user11, person11@example.com)",
+      "(12, user12, person12@example.com)",
+      "(13, user13, person13@example.com)",
+      "(14, user14, person14@example.com)",
+      "(15, user15, person15@example.com)",
+      "Executed.",
+      "db > ",
+  };
+
+  Output result = run_script(commands, 17);
+  // Ruby checks result[15...result.length]: skip the 15 "Executed." lines.
+  expect_output("prints all rows in a multi-level tree",
+                drop_lines(result, num_inserts), expected, 17);
+  free_output(&result);
+}
+
 int main(void)
 {
   printf("database\n");
@@ -553,6 +596,7 @@ int main(void)
   test_prints_constants();
   test_allows_printing_out_the_structure_of_a_one_node_btree();
   test_allows_printing_out_the_structure_of_a_3_leaf_node_btree();
+  test_prints_all_rows_in_a_multi_level_tree();
 
   printf("\n%d test%s, %d failure%s\n", tests_run, tests_run == 1 ? "" : "s",
          tests_failed, tests_failed == 1 ? "" : "s");
